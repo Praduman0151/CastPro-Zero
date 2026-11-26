@@ -14,7 +14,6 @@ import android.util.Log
 import android.view.Surface
 import com.castpro.zero.protocol.*
 import com.castpro.zero.phone.net.PhoneSenderTransport
-import java.nio.ByteBuffer
 import androidx.core.app.ServiceCompat
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -109,8 +108,8 @@ class PhoneCaptureService : Service() {
             } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 try {
                     val format = enc.outputFormat
-                    val csd0 = format.getByteBuffer("csd-0")?.duplicate()?.let { ByteArray(it.remaining()).also(it::get) }
-                    val csd1 = format.getByteBuffer("csd-1")?.duplicate()?.let { ByteArray(it.remaining()).also(it::get) }
+                    val csd0 = format.getByteBuffer("csd-0")?.duplicate()?.let { buffer -> ByteArray(buffer.remaining()).also { buffer.get(it) } }
+                    val csd1 = format.getByteBuffer("csd-1")?.duplicate()?.let { buffer -> ByteArray(buffer.remaining()).also { buffer.get(it) } }
                     val annexB = listOfNotNull(csd0, csd1).fold(ByteArray(0)) { acc, nal -> acc + byteArrayOf(0, 0, 0, 1) + nal }
                     val sets = AnnexB.extract(annexB, VideoCodec.AVC)
                     if (sets != null) sender?.sendCsd(1, sets.annexB())
