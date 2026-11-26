@@ -14,7 +14,8 @@ class PhoneSenderTransport(
     private val udpPort: Int,
     private val pairingToken: String,
     private val onPli: () -> Unit,
-    private val onRtt: (Long) -> Unit = {}
+    private val onRtt: (Long) -> Unit = {},
+    private val onSyncFrameRequest: () -> Unit = {}
 ) : AutoCloseable {
     private val running = AtomicBoolean(false)
     private var tcp: Socket? = null
@@ -22,6 +23,7 @@ class PhoneSenderTransport(
     private var sessionId: Long = 0
     private var sequence = 2L
     private var frameId = 0L
+    @Volatile private var cachedCsd: Pair<Int, ByteArray>? = null
 
     @Synchronized fun connect(): Long {
         check(!running.get()) { "Transport already connected" }
@@ -46,7 +48,12 @@ class PhoneSenderTransport(
     }
 
     fun sendStreamConfig(config: ControlMessage.StreamConfig) = sendControl(config)
-    fun sendCsd(codec: Int, annexB: ByteArray) = sendControl(ControlMessage.VideoCsd(codec, annexB))
+    fun sendCsd(codec: Int, annexB: ByteArray) {
+        cachedCsd = codec to annexB.copyOf()
+        sendControl(ControlMessage.VideoCsd(codec, annexB))
+    }
+
+    fun sendPing(pingSequence: Long = System.nanoTime()) = sendControl(ControlMessage.Ping(System.nanoTime(), pingSequence))
 
     @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime()) {
         check(running.get()) { "Pairing is required before UDP video" }
@@ -70,7 +77,11 @@ class PhoneSenderTransport(
                 val frame = ControlFraming.read(socket.getInputStream()) ?: break
                 if (frame.sessionId != sessionId) continue
                 when (val message = ControlMessageCodec.decode(frame.type, frame.payload)) {
-                    is ControlMessage.Pli -> onPli()
+                    is ControlMessage.Pli -> {
+                        cachedCsd?.let { (codec, data) -> sendCsd(codec, data) }
+                        onSyncFrameRequest()
+                        onPli()
+                    }
                     is ControlMessage.Pong -> onRtt((System.nanoTime() - message.timestampNs).coerceAtLeast(0) / 1_000_000)
                     is ControlMessage.Stop -> { close(); break }
                     else -> Unit
