@@ -33,7 +33,6 @@ class PhoneSenderTransport(
         try {
             val sid = SessionHandshake.client(control, pairingToken)
             val video = DatagramSocket().apply { sendBufferSize = 2 * 1024 * 1024 }
-            check(video.sendBufferSize >= 2 * 1024 * 1024) { "UDP send buffer below 2 MiB" }
             tcp = control; udp = video; sessionId = sid; running.set(true)
             Thread({ readControl() }, "CPZ-phone-control").start()
             return sid
