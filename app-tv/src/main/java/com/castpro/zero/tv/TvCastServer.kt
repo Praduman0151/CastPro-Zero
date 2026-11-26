@@ -20,6 +20,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
     private var surface: Surface? = null
     @Volatile private var sessionId = 0L
     @Volatile private var authenticated = false
+    @Volatile private var authenticatedPeer: InetAddress? = null
     private var sequence = 0L
     private var csd: ByteArray? = null
     private var stream: ControlMessage.StreamConfig? = null
@@ -43,7 +44,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
         try {
             val ip = privateAddress() ?: error("No private IPv4 LAN interface")
             tcpServer = ServerSocket(45670, 4, ip)
-            udp = DatagramSocket(45671, ip).apply { receiveBufferSize = 4 * 1024 * 1024 }
+            udp = DatagramSocket(45671, ip).apply { receiveBufferSize = 4 * 1024 * 1024; check(receiveBufferSize >= 4 * 1024 * 1024) { "UDP receive buffer below 4 MiB" } }
             status("Offline receiver ready at " + ip.hostAddress)
             Thread({ receiveVideo() }, "CPZ-TV-udp").start()
             while (running.get()) handle(tcpServer!!.accept())
@@ -55,6 +56,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
             val sid = SessionHandshake.server(socket, pairingToken)
             control = socket
             sessionId = sid
+            authenticatedPeer = socket.inetAddress
             authenticated = true
             status("Authenticated phone session " + java.lang.Long.toUnsignedString(sid))
             val input = socket.getInputStream()
@@ -87,6 +89,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
             if (running.get()) Log.w("CPZ-TV", "Unauthenticated or disconnected peer", e)
         } finally {
             authenticated = false
+            authenticatedPeer = null
             if (control === socket) control = null
             try { socket.close() } catch (_: Exception) {}
         }
@@ -127,11 +130,15 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
     private fun receiveVideo() {
         val socket = udp ?: return
         var reassembler: VideoReassembler? = null
+        var reassemblerSession = 0L
+        socket.soTimeout = 100
         val bytes = ByteArray(1360)
         while (running.get()) try {
             val packet = DatagramPacket(bytes, bytes.size); socket.receive(packet)
             if (!authenticated) continue
-            val activeReassembler = reassembler ?: VideoReassembler(sessionId).also { reassembler = it }
+            if (packet.address != authenticatedPeer || !LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) { dropped++; continue }
+            if (reassembler == null || reassemblerSession != sessionId) { reassembler = VideoReassembler(sessionId); reassemblerSession = sessionId }
+            val activeReassembler = reassembler!!
             val fragment = try { VideoFragment.decode(packet.data.copyOf(packet.length)) } catch (_: Exception) { dropped++; continue }
             if (fragment.sessionId != sessionId) { dropped++; continue }
             val result = activeReassembler.accept(packet.data.copyOf(packet.length), System.nanoTime())
@@ -147,6 +154,8 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
                 input.clear(); input.put(frame.bytes)
                 c.queueInputBuffer(index, 0, frame.bytes.size, frame.captureTimestampNs / 1000L, 0)
             }
+        } catch (e: SocketTimeoutException) {
+            if (authenticated && reassembler?.expire(System.nanoTime()) == true) requestPli(1)
         } catch (e: Exception) { if (running.get()) Log.w("CPZ-TV", "UDP receive error", e) }
     }
 
@@ -169,6 +178,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
     fun stop() {
         running.set(false)
         authenticated = false
+        authenticatedPeer = null
         sessionId = 0L
         try { tcpServer?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
