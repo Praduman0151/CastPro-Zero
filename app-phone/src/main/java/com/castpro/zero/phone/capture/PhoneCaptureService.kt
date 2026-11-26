@@ -12,6 +12,9 @@ import android.net.wifi.WifiManager
 import android.os.*
 import android.util.Log
 import android.view.Surface
+import com.castpro.zero.protocol.*
+import com.castpro.zero.phone.net.PhoneSenderTransport
+import java.nio.ByteBuffer
 import androidx.core.app.ServiceCompat
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -21,6 +24,7 @@ class PhoneCaptureService : Service() {
     private var codec: MediaCodec? = null
     private var surface: Surface? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var sender: PhoneSenderTransport? = null
     private val active = AtomicBoolean(false)
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -32,8 +36,17 @@ class PhoneCaptureService : Service() {
         ServiceCompat.startForeground(this, 41, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         val code = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
         val consent = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
-        if (code == 0 || consent == null) { stopSelf(); return START_NOT_STICKY }
+        val host = intent?.getStringExtra(EXTRA_TV_IP)
+        val token = intent?.getStringExtra(EXTRA_PAIRING_TOKEN)
+        val tcpPort = intent?.getIntExtra(EXTRA_TCP_PORT, 45670) ?: 45670
+        val udpPort = intent?.getIntExtra(EXTRA_UDP_PORT, 45671) ?: 45671
+        if (code == 0 || consent == null || host.isNullOrBlank() || token.isNullOrBlank()) { stopSelf(); return START_NOT_STICKY }
         try {
+            sender = PhoneSenderTransport(host, tcpPort, udpPort, token,
+                onPli = {}, onSyncFrameRequest = {
+                    try { codec?.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+                    catch (e: Exception) { Log.w(TAG, "Sync-frame request failed", e) }
+                }).also { it.connect() }
             // Fresh one-use consent data is required for every projection session.
             projection = getSystemService(MediaProjectionManager::class.java).getMediaProjection(code, consent)
             projection?.registerCallback(object : MediaProjection.Callback() {
@@ -61,6 +74,7 @@ class PhoneCaptureService : Service() {
         enc.start()
         display = projection?.createVirtualDisplay("CastPro-Zero", 1920, 1080, resources.displayMetrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null)
+        sender?.sendStreamConfig(ControlMessage.StreamConfig(1, 1920, 1080, 60, bitrate, 1, 3, 2))
         active.set(true)
         Thread({ drain(enc) }, "CPZ-encoder-drain").start()
     }
@@ -70,9 +84,28 @@ class PhoneCaptureService : Service() {
         while (active.get()) {
             val index = try { enc.dequeueOutputBuffer(info, 10_000) } catch (_: Exception) { break }
             if (index >= 0) {
-                // Output is intentionally discarded until an authenticated LAN session is paired.
-                // No media is sent to cellular or an internet endpoint.
-                enc.releaseOutputBuffer(index, false)
+                try {
+                    val output = enc.getOutputBuffer(index)
+                    if (output != null && info.size > 0) {
+                        val data = ByteArray(info.size)
+                        val view = output.duplicate()
+                        view.position(info.offset)
+                        view.limit(info.offset + info.size)
+                        view.get(data)
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                            val sets = AnnexB.extract(data, VideoCodec.AVC)
+                            if (sets != null) sender?.sendCsd(1, sets.annexB())
+                        } else {
+                            val keyframe = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                            sender?.sendVideoFrame(data, keyframe, info.presentationTimeUs * 1_000L)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Authenticated LAN frame transmission failed", e)
+                    active.set(false)
+                } finally {
+                    enc.releaseOutputBuffer(index, false)
+                }
             }
         }
     }
@@ -84,6 +117,8 @@ class PhoneCaptureService : Service() {
         try { surface?.release() } catch (_: Exception) {}; surface = null
         try { projection?.stop() } catch (_: Exception) {}; projection = null
         try { wifiLock?.release() } catch (_: Exception) {}; wifiLock = null
+        try { sender?.sendControl(ControlMessage.Stop(0)) } catch (_: Exception) {}
+        try { sender?.close() } catch (_: Exception) {}; sender = null
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
     override fun onDestroy() { stopCapture(); super.onDestroy() }
@@ -95,6 +130,10 @@ class PhoneCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_BITRATE = "bitrate"
+        const val EXTRA_TV_IP = "tv_ip"
+        const val EXTRA_PAIRING_TOKEN = "pairing_token"
+        const val EXTRA_TCP_PORT = "tcp_port"
+        const val EXTRA_UDP_PORT = "udp_port"
         private const val CHANNEL = "cpz_capture"
         private const val TAG = "CPZ-Capture"
     }
