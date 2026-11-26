@@ -257,3 +257,35 @@ class PhoneCaptureService : Service() {
         stopSelf()
     }
 
+
+    override fun onDestroy() {
+        stopCapture()
+        super.onDestroy()
+    }
+
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL, "Screen casting", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+    }
+
+    companion object {
+        const val ACTION_STOP = "com.castpro.zero.phone.action.STOP"
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_RESULT_DATA = "result_data"
+        const val EXTRA_BITRATE = "bitrate_mbps"
+        const val EXTRA_TV_IP = "tv_ip"
+        const val EXTRA_PAIRING_TOKEN = "pairing_token"
+        const val EXTRA_TCP_PORT = "tcp_port"
+        const val EXTRA_UDP_PORT = "udp_port"
+        private const val WIDTH = 1920
+        private const val HEIGHT = 1080
+        private const val FPS = 60
+        private const val DEFAULT_TCP_PORT = 45670
+        private const val DEFAULT_UDP_PORT = 45671
+        private const val CHANNEL = "cpz_capture"
+        private const val TAG = "CPZ-Capture"
+    }
+}
