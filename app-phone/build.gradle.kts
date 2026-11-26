@@ -6,7 +6,7 @@ plugins {
 android {
     namespace = "com.castpro.zero.phone"
     compileSdk = libs.versions.compileSdk.get().toInt()
-    defaultConfig { applicationId = "com.castpro.zero.phone"; minSdk = 34; targetSdk = libs.versions.targetSdk.get().toInt(); versionCode = 1; versionName = "1.0.0" }
+    defaultConfig { applicationId = "com.castpro.zero.phone"; minSdk = 34; targetSdk = libs.versions.targetSdk.get().toInt(); versionCode = 2; versionName = "1.1.0" }
     buildFeatures { compose = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }
@@ -18,6 +18,11 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+    implementation("androidx.core:core:1.17.0")
+    implementation("androidx.camera:camera-camera2:1.5.1")
+    implementation("androidx.camera:camera-lifecycle:1.5.1")
+    implementation("androidx.camera:camera-view:1.5.1")
+    implementation("com.google.zxing:core:3.5.4")
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation(libs.junit)
 }
