@@ -27,6 +27,28 @@ jobs:
           packages: platform-tools
       - name: Run exact Milestone validation
         run: ./gradlew --no-daemon :core-protocol:test :app-phone:testDebugUnitTest :app-tv:testDebugUnitTest :app-phone:assembleDebug :app-tv:assembleDebug
+      - name: Report exact JUnit test counts
+        if: success()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+          modules = {
+              "core-protocol": "core-protocol/build/test-results/test/*.xml",
+              "app-phone": "app-phone/build/test-results/testDebugUnitTest/*.xml",
+              "app-tv": "app-tv/build/test-results/testDebugUnitTest/*.xml",
+          }
+          for module, pattern in modules.items():
+              totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+              files = glob.glob(pattern)
+              for path in files:
+                  root = ET.parse(path).getroot()
+                  for key in totals:
+                      totals[key] += int(root.attrib.get(key, 0))
+              passed = totals["tests"] - totals["failures"] - totals["errors"] - totals["skipped"]
+              print(f"TEST_COUNT {module}: total={totals['tests']} passed={passed} failures={totals['failures']} errors={totals['errors']} skipped={totals['skipped']}")
+          PY
       - name: Upload phone APK
         uses: actions/upload-artifact@v4
         with:
