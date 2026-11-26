@@ -20,6 +20,7 @@ class ProtocolTests {
             m is ControlMessage.Pong && decoded is ControlMessage.Pong -> assertEquals(m,decoded)
             m is ControlMessage.Pli && decoded is ControlMessage.Pli -> assertEquals(m,decoded)
             m is ControlMessage.Stop && decoded is ControlMessage.Stop -> assertEquals(m,decoded)
+            m is ControlMessage.RttReport && decoded is ControlMessage.RttReport -> assertEquals(m,decoded)
             m is ControlMessage.Error && decoded is ControlMessage.Error -> assertEquals(m,decoded)
             else -> fail("Round-trip mismatch: $m")
         }
@@ -27,7 +28,8 @@ class ProtocolTests {
     @Test fun everyControlSerializerRoundTrips() {
         listOf(ControlMessage.Hello(1,nonce,7),ControlMessage.HelloAck(true,nonce,3),ControlMessage.PairConfirm("PairingToken_123456789"),
             ControlMessage.StreamConfig(1,1920,1080,60,25_000_000,1,3,2),ControlMessage.VideoCsd(1,byteArrayOf(0,0,0,1,0x67,1,0,0,0,1,0x68,1)),
-            ControlMessage.Ping(123456,9),ControlMessage.Pong(123456,9),ControlMessage.Pli(1),ControlMessage.Stop(2),ControlMessage.Error(500,"bad frame")).forEach(::roundTrip)
+            ControlMessage.Ping(123456,9),ControlMessage.Pong(123456,9),ControlMessage.Pli(1),ControlMessage.Stop(2),
+            ControlMessage.RttReport(37),ControlMessage.Error(500,"bad frame")).forEach(::roundTrip)
     }
     @Test fun fragmentedTcpReadsAndCleanEof() {
         val out=ByteArrayOutputStream(); ControlFraming.write(out,ControlFrame(ControlType.PING,sequence=4,sessionId=99,payload=byteArrayOf(1,2)))

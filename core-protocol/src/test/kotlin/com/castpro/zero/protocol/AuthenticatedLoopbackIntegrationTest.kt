@@ -130,6 +130,47 @@ class AuthenticatedLoopbackIntegrationTest {
         listener.close()
     }
 
+    @Test fun rttReportReachesReceiverAfterAuthenticatedPingPong() {
+        val loopback = InetAddress.getLoopbackAddress()
+        val listener = ServerSocket(0, 1, loopback)
+        val done = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>()
+        val server = Thread {
+            try {
+                listener.accept().use { peer ->
+                    peer.soTimeout = 5_000
+                    val sid = SessionHandshake.server(peer, token, allowLoopbackForTests = true)
+                    val ping = ControlFraming.read(peer.getInputStream())!!
+                    assertEquals(ControlType.PING, ping.type)
+                    val sent = ControlMessageCodec.decode(ping.type, ping.payload) as ControlMessage.Ping
+                    ControlFraming.write(peer.getOutputStream(), ControlFrame(type = ControlType.PONG,
+                        sequence = 1, sessionId = sid,
+                        payload = ControlMessageCodec.encode(ControlMessage.Pong(sent.timestampNs, sent.pingSequence))))
+                    val report = ControlFraming.read(peer.getInputStream())!!
+                    assertEquals(ControlType.RTT_REPORT, report.type)
+                    assertEquals(42L, (ControlMessageCodec.decode(report.type, report.payload) as ControlMessage.RttReport).rttMs)
+                }
+            } catch (t: Throwable) { failure.set(t) }
+            finally { done.countDown() }
+        }
+        server.start()
+        Socket(loopback, listener.localPort).use { client ->
+            client.soTimeout = 5_000
+            val sid = SessionHandshake.client(client, token, allowLoopbackForTests = true)
+            val output = client.getOutputStream()
+            ControlFraming.write(output, ControlFrame(type = ControlType.PING, sequence = 2, sessionId = sid,
+                payload = ControlMessageCodec.encode(ControlMessage.Ping(System.nanoTime(), 7))))
+            val pong = ControlFraming.read(client.getInputStream())!!
+            assertEquals(ControlType.PONG, pong.type)
+            assertEquals(7L, (ControlMessageCodec.decode(pong.type, pong.payload) as ControlMessage.Pong).pingSequence)
+            ControlFraming.write(output, ControlFrame(type = ControlType.RTT_REPORT, sequence = 3, sessionId = sid,
+                payload = ControlMessageCodec.encode(ControlMessage.RttReport(42))))
+        }
+        assertTrue("RTT loopback server did not finish", done.await(3, TimeUnit.SECONDS))
+        failure.get()?.let { throw AssertionError("RTT loopback failed", it) }
+        listener.close()
+    }
+
     private fun receiveFrame(socket: DatagramSocket, reassembler: VideoReassembler, count: Int): ReassembledFrame? {
         socket.soTimeout = 1000
         var result: ReassembledFrame? = null

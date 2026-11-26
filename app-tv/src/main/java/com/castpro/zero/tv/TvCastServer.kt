@@ -54,6 +54,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     @Volatile private var decoderName = "idle"
     @Volatile private var resolution = "—"
     private var sequence = 0L
+    private var lastPliNs = 0L
     private var firstTenFrames = 0
     @Volatile private var discoveryStarted = false
     @Volatile private var firstRenderedFrameLogged = false
@@ -95,6 +96,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                 val ip = lan.address.hostAddress ?: continue
                 val tcp = ServerSocket(TCP_PORT, 4, lan.address)
                 val video = DatagramSocket(UDP_PORT, lan.address).apply { receiveBufferSize = 4 * 1024 * 1024; soTimeout = 100 }
+                Log.i("CPZ-TV", "UDP receive buffer requested=4 MiB actual=${video.receiveBufferSize}")
                 tcpServer = tcp; udp = video
                 callbacks.onAddress(ip, pairingToken)
                 callbacks.onStatus("Receiver ready · $ip")
@@ -123,23 +125,40 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         discoveryStarted = true
         Thread({
             var localSocket: DatagramSocket? = null
+            var lastAdvertiseNs = 0L
             try {
-                val socket = DatagramSocket(null).apply { reuseAddress = true; broadcast = true; bind(InetSocketAddress(DISCOVERY_PORT)) }
+                val socket = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    broadcast = true
+                    soTimeout = 250
+                    bind(InetSocketAddress(DISCOVERY_PORT))
+                }
                 localSocket = socket
                 discovery = socket
                 while (running.get()) {
-                    val lan = privateAddress()
-                    if (lan == null) { Thread.sleep(1000); continue }
-                    val ip = lan.address.hostAddress
-                    if (ip == null) { Thread.sleep(1000); continue }
-                    val payload = TvDiscoveryPacketCodec.encode(TvDiscoveryPacket(
-                        name = Build.MODEL ?: "CastPro-Zero TV",
-                        ipAddress = ip, tcpPort = TCP_PORT, udpPort = UDP_PORT, pairingToken = pairingToken,
-                        expiryEpochSeconds = System.currentTimeMillis() / 1000L + 3600L
-                    ))
+                    val request = DatagramPacket(ByteArray(256), 256)
+                    try {
+                        socket.receive(request)
+                        val text = String(request.data, 0, request.length, Charsets.UTF_8).trim()
+                        if (text == Discovery.REQUEST_MAGIC) {
+                            val lanForReply = privateAddress()
+                            val replyIp = lanForReply?.address?.hostAddress
+                            if (replyIp != null) {
+                                val reply = advertisement(replyIp)
+                                socket.send(DatagramPacket(reply, reply.size, request.address, request.port))
+                            }
+                        }
+                    } catch (_: java.net.SocketTimeoutException) {
+                        // Allows periodic advertisement and shutdown checks.
+                    }
+                    val now = System.nanoTime()
+                    if (now - lastAdvertiseNs < 1_500_000_000L) continue
+                    val lan = privateAddress() ?: continue
+                    val ip = lan.address.hostAddress ?: continue
+                    val payload = advertisement(ip)
                     val broadcastAddress = lan.broadcast ?: InetAddress.getByName("255.255.255.255")
                     socket.send(DatagramPacket(payload, payload.size, broadcastAddress, DISCOVERY_PORT))
-                    Thread.sleep(1500)
+                    lastAdvertiseNs = now
                 }
             } catch (e: Exception) {
                 if (running.get()) Log.w("CPZ-TV", "Discovery responder unavailable", e)
@@ -151,6 +170,17 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         }, "CPZ-TV-discovery").start()
     }
 
+    /** Same wire format as the offline QR code, so phone discovery and scanning share one parser. */
+    private fun advertisement(ip: String): ByteArray = PairingPayloadCodec.encode(
+        TvPairingPayload(
+            ipAddress = ip,
+            tcpPort = TCP_PORT,
+            udpPort = UDP_PORT,
+            pairingToken = pairingToken,
+            expiryEpochSeconds = System.currentTimeMillis() / 1000L + 3600L
+        )
+    ).toByteArray(Charsets.UTF_8)
+
     private fun handle(socket: Socket) {
         try {
             socket.soTimeout = 15000
@@ -158,6 +188,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
             control = socket; sessionId = sid; authenticatedPeer = socket.inetAddress; authenticated = true
             firstTenFrames = 0
             firstRenderedFrameLogged = false
+            lastPliNs = 0L
             callbacks.onStatus("Authenticated phone session")
             val input = socket.getInputStream(); val output = socket.getOutputStream()
             while (running.get() && !socket.isClosed && authenticated) {
@@ -185,6 +216,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                         type = ControlType.PONG, sequence = sequence++, sessionId = sessionId,
                         payload = ControlMessageCodec.encode(ControlMessage.Pong(message.timestampNs, message.pingSequence))))
                     is ControlMessage.Pong -> Unit
+                    is ControlMessage.RttReport -> rttMs = message.rttMs.coerceAtLeast(0)
                     is ControlMessage.Stop -> {
                         clearSession("Casting stopped")
                         break
@@ -236,6 +268,11 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     }
 
     private fun queueCsd(codec: MediaCodec, data: ByteArray) {
+        if (AnnexB.extract(data, VideoCodec.AVC) == null) {
+            Log.w("CPZ-TV", "Refusing invalid Annex-B AVC CSD after codec.start()")
+            requestPli(7)
+            return
+        }
         val index = codec.dequeueInputBuffer(10000)
         if (index < 0) { Log.w("CPZ-TV", "No input buffer available for CSD"); requestPli(7); return }
         val input = codec.getInputBuffer(index) ?: run { requestPli(7); return }
@@ -323,10 +360,14 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         }
     }
 
+    /** At most one PLI control frame per 100 ms, including burst loss reports. */
     private fun requestPli(reason: Int) {
+        val now = System.nanoTime()
+        if (now - lastPliNs < PLI_COALESCE_NS) return
+        val s = control ?: return
+        lastPliNs = now
         pliCount++
         try {
-            val s = control ?: return
             ControlFraming.write(s.getOutputStream(), ControlFrame(type = ControlType.PLI,
                 sequence = sequence++, sessionId = sessionId,
                 payload = ControlMessageCodec.encode(ControlMessage.Pli(reason))))

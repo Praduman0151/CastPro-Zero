@@ -14,6 +14,8 @@ sealed interface ControlMessage {
     data class Pong(val timestampNs:Long,val pingSequence:Long):ControlMessage
     data class Pli(val reason:Int):ControlMessage
     data class Stop(val reason:Int):ControlMessage
+    /** Phone-measured RTT, reported back to the TV for its on-screen HUD. */
+    data class RttReport(val rttMs:Long):ControlMessage
     data class Error(val code:Int,val message:String):ControlMessage
 }
 
@@ -28,6 +30,7 @@ object ControlMessageCodec {
         is ControlMessage.Pong->ControlType.PONG
         is ControlMessage.Pli->ControlType.PLI
         is ControlMessage.Stop->ControlType.STOP
+        is ControlMessage.RttReport->ControlType.RTT_REPORT
         is ControlMessage.Error->ControlType.ERROR
     }
     fun encode(m:ControlMessage):ByteArray {
@@ -41,6 +44,7 @@ object ControlMessageCodec {
             is ControlMessage.Pong->ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN).putLong(m.timestampNs).putLong(m.pingSequence).array()
             is ControlMessage.Pli->byteArrayOf(m.reason.toByte())
             is ControlMessage.Stop->ByteBuffer.allocate(2).order(ByteOrder.BIG_ENDIAN).putShort(m.reason.toShort()).array()
+            is ControlMessage.RttReport->ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(m.rttMs).array()
             is ControlMessage.Error->ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(m.code).array()+stringField(m.message,1024)
         }
         require(out.size<=MAX_CONTROL_PAYLOAD)
@@ -60,6 +64,7 @@ object ControlMessageCodec {
                 ControlType.PONG->{exact(payload,16);ControlMessage.Pong(b.long,b.long)}
                 ControlType.PLI->{exact(payload,1);ControlMessage.Pli(b.get().toInt() and 255)}
                 ControlType.STOP->{exact(payload,2);ControlMessage.Stop(b.short.toInt() and 65535)}
+                ControlType.RTT_REPORT->{exact(payload,8);ControlMessage.RttReport(b.long)}
                 ControlType.ERROR->{if(payload.size<6)throw ProtocolException("Invalid ERROR");val code=b.int;val rest=ByteArray(b.remaining()).also(b::get);ControlMessage.Error(code,readStringField(rest,1024))}
             }
         } catch(e:ProtocolException){throw e}catch(e:Exception){throw ProtocolException("Malformed $type payload",e)}
