@@ -44,7 +44,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
         try {
             val ip = privateAddress() ?: error("No private IPv4 LAN interface")
             tcpServer = ServerSocket(45670, 4, ip)
-            udp = DatagramSocket(45671, ip).apply { receiveBufferSize = 4 * 1024 * 1024; check(receiveBufferSize >= 4 * 1024 * 1024) { "UDP receive buffer below 4 MiB" } }
+            udp = DatagramSocket(45671, ip).apply { receiveBufferSize = 4 * 1024 * 1024 }
             status("Offline receiver ready at " + ip.hostAddress)
             Thread({ receiveVideo() }, "CPZ-TV-udp").start()
             while (running.get()) handle(tcpServer!!.accept())
@@ -74,7 +74,7 @@ class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: 
                     }
                     is ControlMessage.Ping -> ControlFraming.write(output, ControlFrame(
                         type = ControlType.PONG, sequence = sequence++, sessionId = sessionId,
-                        payload = ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(), message.pingSequence))))
+                        payload = ControlMessageCodec.encode(ControlMessage.Pong(message.timestampNs, message.pingSequence))))
                     is ControlMessage.Stop -> {
                         authenticated = false
                         sessionId = 0L
