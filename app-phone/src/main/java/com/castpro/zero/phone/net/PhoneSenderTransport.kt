@@ -28,6 +28,7 @@ class PhoneSenderTransport(
     private var sessionId = 0L
     private var sequence = 2L
     private var frameId = 0L
+    data class VideoSendResult(val frameId: Long, val fragmentCount: Int, val byteCount: Int)
     private val framesSent = AtomicLong()
     private val bytesSent = AtomicLong()
     private val pliCount = AtomicLong()
@@ -43,6 +44,7 @@ class PhoneSenderTransport(
         try {
             if (binding != null) binding.bindTcp(control) else control.bind(InetSocketAddress(0))
             control.connect(InetSocketAddress(address, tcpPort), 5_000)
+            binding?.validateTcp(control)
             control.tcpNoDelay = true
             val sid = SessionHandshake.client(control, pairingToken)
             val video = DatagramSocket(null)
@@ -91,9 +93,10 @@ class PhoneSenderTransport(
 
     fun sendRttReport(rttMs: Long) = sendControl(ControlMessage.RttReport(rttMs))
 
-    @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime()) {
+    @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime()): VideoSendResult {
         check(running.get()) { "Pairing is required before UDP video" }
-        val fragments = VideoFragmenter.fragment(bytes, sessionId, frameId++,
+        val currentFrameId = frameId++
+        val fragments = VideoFragmenter.fragment(bytes, sessionId, currentFrameId,
             if (keyframe) 4 else 0, timestampNs)
         val socket = udp ?: error("UDP unavailable")
         val target = InetAddress.getByName(host)
@@ -106,6 +109,7 @@ class PhoneSenderTransport(
                 LockSupport.parkNanos(pacing.pauseMicros * 1_000L)
         }
         framesSent.incrementAndGet()
+        return VideoSendResult(currentFrameId, fragments.size, bytes.size)
     }
 
     private fun readControl() {
@@ -121,6 +125,7 @@ class PhoneSenderTransport(
                         onSyncFrameRequest()
                         onPli()
                     }
+                    is ControlMessage.Ping -> sendControl(ControlMessage.Pong(message.timestampNs, message.pingSequence))
                     is ControlMessage.Pong -> {
                         val measured = (System.nanoTime() - message.timestampNs).coerceAtLeast(0) / 1_000_000
                         rttMs = measured

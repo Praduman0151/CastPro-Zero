@@ -1,9 +1,11 @@
 package com.castpro.zero.phone
 
 import android.Manifest
-import android.app.Activity.RESULT_OK
+import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -45,87 +48,108 @@ import com.castpro.zero.phone.capture.BitrateOptions
 import com.castpro.zero.phone.capture.PhoneCaptureService
 import com.castpro.zero.phone.net.LocalNetworkBinding
 import com.castpro.zero.phone.net.PhoneDiscovery
+import com.castpro.zero.phone.BitrateSessionState
 import com.castpro.zero.phone.scan.OfflineQrAnalyzer
-import com.castpro.zero.protocol.PairingPayloadCodec
-import com.castpro.zero.protocol.ProtocolException
 import com.castpro.zero.protocol.SenderStats
-
-private data class TvDevice(val ip: String, val token: String, val tcpPort: Int, val udpPort: Int)
+import com.castpro.zero.protocol.TvPairingPayload
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 private data class PhoneUiState(
-    val devices: Map<String, TvDevice> = emptyMap(),
+    val devices: Map<String, TvPairingPayload> = emptyMap(),
     val selectedIp: String = "",
     val token: String = "",
     val manualIp: String = "",
+    val tcpPort: String = "45670",
+    val udpPort: String = "45671",
     val bitrateMbps: Int = BitrateOptions.DEFAULT_MBPS,
+    val sessionState: BitrateSessionState = BitrateSessionState(),
     val stats: SenderStats = SenderStats(),
     val streaming: Boolean = false,
     val scanner: Boolean = false,
-    val message: String = "Scan the TV QR code or discover a receiver on this LAN."
+    val message: String = "Discover a TV on this LAN or scan its offline QR code."
 )
 
 class MainActivity : ComponentActivity() {
     private val ui = mutableStateOf(PhoneUiState())
     private var discovery: PhoneDiscovery? = null
     private lateinit var projectionLauncher: ActivityResultLauncher<Intent>
+    private lateinit var notificationPermissionLauncher: ActivityResultLauncher<String>
+    private var continueAfterNotificationPrompt = false
 
     private val requestCameraPermission: ActivityResultLauncher<String> =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             ui.value = if (granted) {
                 ui.value.copy(scanner = true, message = "Point the camera at the TV QR code.")
             } else {
-                ui.value.copy(message = "Camera permission is needed for QR pairing.")
+                ui.value.copy(message = "Camera permission is required to scan a QR code.")
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode != RESULT_OK || result.data == null) {
+            if (result.resultCode != Activity.RESULT_OK || result.data == null) {
                 ui.value = ui.value.copy(message = "Screen capture consent was cancelled.")
                 return@registerForActivityResult
             }
-            val ip = ui.value.selectedIp.ifBlank { ui.value.manualIp }
-            val token = ui.value.token
-            if (ip.isBlank() || token.isBlank()) {
-                ui.value = ui.value.copy(message = "Choose a receiver and pair before casting.")
-                return@registerForActivityResult
-            }
-            val device = ui.value.devices[ip]
+            val state = ui.value
             startForegroundService(Intent(this, PhoneCaptureService::class.java).apply {
                 putExtra(PhoneCaptureService.EXTRA_RESULT_CODE, result.resultCode)
                 putExtra(PhoneCaptureService.EXTRA_RESULT_DATA, result.data)
-                putExtra(PhoneCaptureService.EXTRA_TV_IP, ip)
-                putExtra(PhoneCaptureService.EXTRA_PAIRING_TOKEN, token)
-                putExtra(PhoneCaptureService.EXTRA_TCP_PORT, device?.tcpPort ?: 45670)
-                putExtra(PhoneCaptureService.EXTRA_UDP_PORT, device?.udpPort ?: 45671)
-                putExtra(PhoneCaptureService.EXTRA_BITRATE, ui.value.bitrateMbps)
+                putExtra(PhoneCaptureService.EXTRA_TV_IP, state.selectedIp)
+                putExtra(PhoneCaptureService.EXTRA_PAIRING_TOKEN, state.token)
+                putExtra(PhoneCaptureService.EXTRA_TCP_PORT, state.tcpPort.toInt())
+                putExtra(PhoneCaptureService.EXTRA_UDP_PORT, state.udpPort.toInt())
+                putExtra(PhoneCaptureService.EXTRA_BITRATE, state.bitrateMbps)
             })
         }
+        notificationPermissionLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                if (continueAfterNotificationPrompt) {
+                    continueAfterNotificationPrompt = false
+                    if (!granted) ui.value = ui.value.copy(
+                        message = "Notifications are disabled; continuing with the foreground capture service."
+                    )
+                    requestProjectionConsent()
+                }
+            }
+
         setContent {
             MaterialTheme {
                 val state by ui
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     if (state.streaming) {
-                        StreamingScreen(state, onStop = { stopService(Intent(this, PhoneCaptureService::class.java)) })
+                        StreamingScreen(state) {
+                            startService(Intent(this, PhoneCaptureService::class.java)
+                                .setAction(PhoneCaptureService.ACTION_STOP))
+                        }
                     } else {
                         SetupScreen(
                             state = state,
                             lifecycleOwner = this,
                             onDiscover = { discovery?.scan() },
-                            onSelect = { ip -> ui.value = ui.value.copy(selectedIp = ip) },
+                            onSelect = { payload ->
+                                ui.value = ui.value.copy(
+                                    selectedIp = payload.ipAddress,
+                                    manualIp = payload.ipAddress,
+                                    token = payload.pairingToken,
+                                    tcpPort = payload.tcpPort.toString(),
+                                    udpPort = payload.udpPort.toString(),
+                                    message = "Selected TV at ${payload.ipAddress}"
+                                )
+                            },
                             onManualIp = { value -> ui.value = ui.value.copy(manualIp = value, selectedIp = value) },
+                            onTcpPort = { value -> ui.value = ui.value.copy(tcpPort = value) },
+                            onUdpPort = { value -> ui.value = ui.value.copy(udpPort = value) },
                             onToken = { value -> ui.value = ui.value.copy(token = value) },
-                            onBitrate = { value -> ui.value = ui.value.copy(bitrateMbps = value) },
+                            onBitrate = { value -> ui.value = ui.value.copy(bitrateMbps = value, sessionState = ui.value.sessionState.select(value)) },
                             onToggleScanner = { open ->
                                 if (open) requestCameraPermission.launch(Manifest.permission.CAMERA)
                                 else ui.value = ui.value.copy(scanner = false)
                             },
-                            onQr = { text -> acceptQr(text) },
-                            onStart = {
-                                val manager = getSystemService(MediaProjectionManager::class.java)
-                                projectionLauncher.launch(manager.createScreenCaptureIntent())
-                            }
+                            onQr = { acceptQr(it) },
+                            onStart = { validateAndStart() }
                         )
                     }
                 }
@@ -135,32 +159,65 @@ class MainActivity : ComponentActivity() {
 
     private fun acceptQr(text: String) {
         try {
-            val payload = PairingPayloadCodec.decode(text)
+            val target = PhoneTargetValidator.qr(text, System.currentTimeMillis() / 1000L)
             ui.value = ui.value.copy(
-                selectedIp = payload.ipAddress,
-                token = payload.pairingToken,
+                selectedIp = target.ipAddress,
+                manualIp = target.ipAddress,
+                token = target.pairingToken,
+                tcpPort = target.tcpPort.toString(),
+                udpPort = target.udpPort.toString(),
                 scanner = false,
-                message = "Paired with ${payload.ipAddress}. Choose a bitrate and start casting."
+                message = "Paired with ${target.ipAddress}. Select a bitrate and start casting."
             )
-        } catch (e: ProtocolException) {
+        } catch (e: Exception) {
             ui.value = ui.value.copy(message = "Invalid or expired pairing QR: ${e.message}")
         }
+    }
+
+    private fun validateAndStart() {
+        try {
+            val state = ui.value
+            val target = PhoneTargetValidator.manual(
+                state.selectedIp.ifBlank { state.manualIp },
+                state.tcpPort,
+                state.udpPort,
+                state.token
+            )
+            ui.value = state.copy(
+                selectedIp = target.ipAddress,
+                manualIp = target.ipAddress,
+                message = "Requesting screen capture permission…"
+            )
+            if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                continueAfterNotificationPrompt = true
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                requestProjectionConsent()
+            }
+        } catch (e: Exception) {
+            ui.value = ui.value.copy(message = "Receiver details are invalid: ${e.message}")
+        }
+    }
+
+    private fun requestProjectionConsent() {
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        projectionLauncher.launch(manager.createScreenCaptureIntent())
     }
 
     override fun onStart() {
         super.onStart()
         PhoneSessionBus.onStats = { snapshot -> runOnUiThread { ui.value = ui.value.copy(stats = snapshot) } }
-        PhoneSessionBus.onStreamingChanged = { active -> runOnUiThread { ui.value = ui.value.copy(streaming = active) } }
+        PhoneSessionBus.onStreamingChanged = { active ->
+            runOnUiThread { ui.value = ui.value.copy(streaming = active, sessionState = if (active) ui.value.sessionState.connectedNow() else ui.value.sessionState.stopped()) }
+        }
         try {
-            discovery = PhoneDiscovery(LocalNetworkBinding(this)) { payload ->
-                val device = TvDevice(payload.ipAddress, payload.pairingToken, payload.tcpPort, payload.udpPort)
+            discovery = PhoneDiscovery(this, LocalNetworkBinding(this)) { payload ->
                 runOnUiThread {
                     val current = ui.value
                     ui.value = current.copy(
-                        devices = current.devices + (device.ip to device),
-                        selectedIp = current.selectedIp.ifBlank { device.ip },
-                        token = current.token.ifBlank { device.token },
-                        message = "Found TV at ${device.ip}"
+                        devices = current.devices + (payload.ipAddress to payload),
+                        message = "Found TV at ${payload.ipAddress}"
                     )
                 }
             }
@@ -184,8 +241,10 @@ private fun SetupScreen(
     state: PhoneUiState,
     lifecycleOwner: LifecycleOwner,
     onDiscover: () -> Unit,
-    onSelect: (String) -> Unit,
+    onSelect: (TvPairingPayload) -> Unit,
     onManualIp: (String) -> Unit,
+    onTcpPort: (String) -> Unit,
+    onUdpPort: (String) -> Unit,
     onToken: (String) -> Unit,
     onBitrate: (Int) -> Unit,
     onToggleScanner: (Boolean) -> Unit,
@@ -196,43 +255,49 @@ private fun SetupScreen(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("CastPro-Zero Phone", style = MaterialTheme.typography.headlineMedium)
+        Text("CastPro-Zero", style = MaterialTheme.typography.headlineMedium)
         Text(state.message)
         if (state.scanner) {
             QrScanner(lifecycleOwner, onQr)
-            Button(onClick = { onToggleScanner(false) }) { Text("Close scanner") }
+            Button(onClick = { onToggleScanner(false) }) { Text("Close QR scanner") }
         } else {
-            Button(onClick = { onToggleScanner(true) }) { Text("Scan TV QR code") }
+            Button(onClick = { onToggleScanner(true) }) { Text("Scan TV QR code (offline)") }
         }
         Button(onClick = onDiscover) { Text("Discover TVs on this LAN") }
         state.devices.values.forEach { device ->
-            Button(onClick = { onSelect(device.ip) }, modifier = Modifier.fillMaxWidth()) {
-                Text("${device.ip}  ·  TCP ${device.tcpPort} / UDP ${device.udpPort}")
+            Button(onClick = { onSelect(device) }, modifier = Modifier.fillMaxWidth()) {
+                Text("${device.ipAddress} · TCP ${device.tcpPort} / UDP ${device.udpPort}")
             }
         }
         OutlinedTextField(
-            value = state.manualIp,
-            onValueChange = onManualIp,
-            label = { Text("Manual TV local IP") },
-            modifier = Modifier.fillMaxWidth()
+            value = state.manualIp, onValueChange = onManualIp,
+            label = { Text("Manual TV private IPv4") }, modifier = Modifier.fillMaxWidth()
         )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = state.tcpPort, onValueChange = onTcpPort,
+                label = { Text("TCP port") }, modifier = Modifier.weight(1f)
+            )
+            OutlinedTextField(
+                value = state.udpPort, onValueChange = onUdpPort,
+                label = { Text("UDP port") }, modifier = Modifier.weight(1f)
+            )
+        }
         OutlinedTextField(
-            value = state.token,
-            onValueChange = onToken,
-            label = { Text("Pairing token") },
-            modifier = Modifier.fillMaxWidth()
+            value = state.token, onValueChange = onToken,
+            label = { Text("Pairing token") }, modifier = Modifier.fillMaxWidth()
         )
-        Text("Bitrate: ${state.bitrateMbps} Mbps")
+        Text("Video bitrate: ${state.bitrateMbps} Mbps")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             BitrateOptions.optionsMbps.forEach { value ->
                 Button(onClick = { onBitrate(value) }, enabled = value != state.bitrateMbps) {
-                    Text("$value")
+                    Text("$value Mbps")
                 }
             }
         }
         Button(
             onClick = onStart,
-            enabled = state.selectedIp.isNotBlank() && state.token.isNotBlank(),
+            enabled = state.selectedIp.isNotBlank() || state.manualIp.isNotBlank(),
             modifier = Modifier.fillMaxWidth()
         ) { Text("Start casting") }
     }
@@ -247,10 +312,10 @@ private fun StreamingScreen(state: PhoneUiState, onStop: () -> Unit) {
         horizontalAlignment = Alignment.Start
     ) {
         Text("Casting to ${state.selectedIp}", style = MaterialTheme.typography.headlineMedium)
-        Text("${stats.fps} fps · ${String.format("%.2f", stats.mbps)} Mbps · ${stats.codec}")
-        Text("RTT: ${if (stats.rttMs < 0) "—" else "${stats.rttMs} ms"} · PLI: ${stats.pliCount}")
+        Text("${stats.fps} fps · ${String.format("%.2f", stats.mbps)} Mbps · ${stats.codec} · ${stats.resolution}")
+        Text("TCP RTT: ${if (stats.rttMs < 0) "—" else "${stats.rttMs} ms"} · PLI: ${stats.pliCount}")
         Text("Frames sent: ${stats.framesSent} · bytes: ${stats.bytesSent}")
-        Button(onClick = onStop) { Text("Stop") }
+        Button(onClick = onStop) { Text("Stop Casting") }
     }
 }
 
@@ -258,27 +323,31 @@ private fun StreamingScreen(state: PhoneUiState, onStop: () -> Unit) {
 private fun QrScanner(lifecycleOwner: LifecycleOwner, onQr: (String) -> Unit) {
     val context = LocalContext.current
     val previewView = remember { PreviewView(context) }
+    val delivered = remember { AtomicBoolean(false) }
     DisposableEffect(Unit) {
         val providerFuture = ProcessCameraProvider.getInstance(context)
-        val executor = ContextCompat.getMainExecutor(context)
-        val listener = Runnable {
+        val executor = Executors.newSingleThreadExecutor()
+        val mainExecutor = ContextCompat.getMainExecutor(context)
+        providerFuture.addListener({
             try {
                 val provider = providerFuture.get()
-                val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
+                val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
-                    .also { it.setAnalyzer(executor, OfflineQrAnalyzer(onQr)) }
+                analysis.setAnalyzer(executor, OfflineQrAnalyzer { value ->
+                    if (delivered.compareAndSet(false, true)) onQr(value)
+                })
                 provider.unbindAll()
                 provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
             } catch (e: Exception) {
-                Log.w("CPZ-Phone-UI", "QR scanner setup failed", e)
+                Log.w("CPZ-Phone-UI", "Offline QR camera setup failed", e)
             }
-        }
-        providerFuture.addListener(listener, executor)
+        }, mainExecutor)
         onDispose {
             try { providerFuture.get().unbindAll() } catch (_: Exception) {}
+            executor.shutdown()
         }
     }
-    AndroidView({ previewView }, Modifier.fillMaxWidth().padding(top = 8.dp))
+    AndroidView(factory = { previewView }, modifier = Modifier.fillMaxWidth().height(300.dp))
 }

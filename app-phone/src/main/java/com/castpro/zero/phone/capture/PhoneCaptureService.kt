@@ -3,6 +3,7 @@ package com.castpro.zero.phone.capture
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -41,17 +42,24 @@ class PhoneCaptureService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var sender: PhoneSenderTransport? = null
     private val active = AtomicBoolean(false)
+    private val stopping = AtomicBoolean(false)
     private var frameLogCount = 0
     private var firstFrameLogged = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) { stopCapture(); return START_NOT_STICKY }
         ensureNotificationChannel()
+        val stopIntent = Intent(this, PhoneCaptureService::class.java).setAction(ACTION_STOP)
+        val stopPendingIntent = PendingIntent.getService(
+            this, 42, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         val notification = Notification.Builder(this, CHANNEL)
             .setContentTitle("CastPro-Zero")
             .setContentText("Screen capture is active")
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .addAction(android.R.drawable.ic_media_pause, "Stop casting", stopPendingIntent)
             .build()
         // Android 15/16: foreground promotion MUST precede getMediaProjection().
         ServiceCompat.startForeground(
@@ -73,6 +81,10 @@ class PhoneCaptureService : Service() {
             sender = PhoneSenderTransport(host, tcpPort, udpPort, token,
                 onPli = {
                     Log.i(TAG, "PLI received; cached CSD replayed and sync frame requested")
+                    sender?.stats()?.copy(resolution = "${WIDTH}×${HEIGHT}")?.let(PhoneSessionBus::publish)
+                },
+                onRtt = { measured ->
+                    sender?.stats()?.copy(rttMs = measured, resolution = "${WIDTH}×${HEIGHT}")?.let(PhoneSessionBus::publish)
                 },
                 onSyncFrameRequest = {
                     try {
@@ -94,7 +106,10 @@ class PhoneCaptureService : Service() {
                 override fun onStop() = stopCapture()
                 override fun onCapturedContentResize(width: Int, height: Int) {
                     if (width > 1 && height > 1) {
-                        display?.resize(width, height, resources.displayMetrics.densityDpi)
+                        display?.let { virtualDisplay ->
+                            virtualDisplay.resize(width, height, resources.displayMetrics.densityDpi)
+                            virtualDisplay.setSurface(surface)
+                        }
                     }
                 }
             }, Handler(mainLooper))
@@ -150,10 +165,9 @@ class PhoneCaptureService : Service() {
                         view.get(data)
                         val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                         val isKeyframe = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                        if (!isConfig && frameLogCount < 10) {
-                            frameLogCount++
-                            Log.i(TAG, "Encoded frame #$frameLogCount: ${info.size} bytes, " +
-                                "pts=${info.presentationTimeUs}us, keyframe=$isKeyframe")
+                        if (!isConfig && !firstFrameLogged) {
+                            firstFrameLogged = true
+                            Log.i(TAG, "First encoder output from ${enc.name}")
                         }
                         if (isConfig) {
                             val sets = AnnexB.extract(data, VideoCodec.AVC)
@@ -165,7 +179,13 @@ class PhoneCaptureService : Service() {
                                 Log.i(TAG, "First transmitted frame wall-clock=${System.nanoTime()} ns, codec=${enc.name}")
                             }
                             // Every encoded access unit is sent; no drop path exists.
-                            sender?.sendVideoFrame(data, isKeyframe, info.presentationTimeUs * 1_000L)
+                            val sent = sender?.sendVideoFrame(data, isKeyframe, info.presentationTimeUs * 1_000L)
+                                ?: error("Sender transport unavailable")
+                            if (frameLogCount < 10) {
+                                frameLogCount++
+                                val nalTypes = AnnexB.nalUnits(data).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
+                                Log.i(TAG, "TX frameId=${sent.frameId} fragCount=${sent.fragmentCount} size=${sent.byteCount} keyframe=$isKeyframe NAL=$nalTypes")
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -194,6 +214,7 @@ class PhoneCaptureService : Service() {
                 }
             }
         }
+        if (active.get()) Handler(mainLooper).post { stopCapture() }
     }
 
     private fun statsLoop(enc: MediaCodec) {
@@ -204,22 +225,20 @@ class PhoneCaptureService : Service() {
             try { Thread.sleep(500) } catch (_: InterruptedException) { break }
             val now = System.nanoTime()
             val elapsed = (now - last).coerceAtLeast(1)
-            val snapshot = sender?.stats() ?: continue
+            val transport = sender ?: continue
+            val snapshot = transport.stats()
             val fps = ((snapshot.framesSent - lastFrames) * 1_000_000_000L / elapsed).toInt()
             val mbps = ((snapshot.bytesSent - lastBytes) * 8_000f / elapsed)
             last = now
             lastFrames = snapshot.framesSent
             lastBytes = snapshot.bytesSent
-            PhoneSessionBus.publish(sender!!.stats(fps, mbps, enc.name))
+            PhoneSessionBus.publish(transport.stats(fps, mbps, enc.name).copy(resolution = "${WIDTH}×${HEIGHT}"))
         }
     }
 
     private fun stopCapture() {
-        if (!active.getAndSet(false)) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return
-        }
+        if (!stopping.compareAndSet(false, true)) return
+        active.set(false)
         try { display?.release() } catch (_: Exception) {}
         display = null
         try { codec?.stop(); codec?.release() } catch (_: Exception) {}
@@ -238,33 +257,3 @@ class PhoneCaptureService : Service() {
         stopSelf()
     }
 
-    override fun onDestroy() {
-        stopCapture()
-        super.onDestroy()
-    }
-
-    private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL, "Screen casting", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-    }
-
-    companion object {
-        const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_RESULT_DATA = "result_data"
-        const val EXTRA_BITRATE = "bitrate_mbps"
-        const val EXTRA_TV_IP = "tv_ip"
-        const val EXTRA_PAIRING_TOKEN = "pairing_token"
-        const val EXTRA_TCP_PORT = "tcp_port"
-        const val EXTRA_UDP_PORT = "udp_port"
-        private const val WIDTH = 1920
-        private const val HEIGHT = 1080
-        private const val FPS = 60
-        private const val DEFAULT_TCP_PORT = 45670
-        private const val DEFAULT_UDP_PORT = 45671
-        private const val CHANNEL = "cpz_capture"
-        private const val TAG = "CPZ-Capture"
-    }
-}

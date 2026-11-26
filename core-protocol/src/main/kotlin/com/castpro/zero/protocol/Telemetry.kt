@@ -8,5 +8,6 @@ data class SenderStats(
     val rttMs: Long = -1,
     val fps: Int = 0,
     val mbps: Float = 0f,
-    val codec: String = "idle"
+    val codec: String = "idle",
+    val resolution: String = "—"
 )

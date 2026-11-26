@@ -10,6 +10,7 @@ import com.castpro.zero.protocol.*
 import java.net.*
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
 
 class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val pairingToken: String = createPairingToken()) {
@@ -46,14 +47,14 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     @Volatile private var rendered = 0L
     @Volatile private var dropped = 0L
     @Volatile private var pliCount = 0L
-    @Volatile private var rttMs = -1L
+    private val rttState = RttTelemetryState()
     @Volatile private var bytesRenderedWindow = 0L
     @Volatile private var liveMbps = 0.0
     @Volatile private var renderedFps = 0L
     
     @Volatile private var decoderName = "idle"
     @Volatile private var resolution = "—"
-    private var sequence = 0L
+    private val sequence = AtomicLong(0L)
     private var lastPliNs = 0L
     private var firstTenFrames = 0
     @Volatile private var discoveryStarted = false
@@ -212,11 +213,13 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                             configureDecoderIfReady()
                         } else Log.w("CPZ-TV", "Rejected invalid Annex-B AVC CSD")
                     }
-                    is ControlMessage.Ping -> ControlFraming.write(output, ControlFrame(
-                        type = ControlType.PONG, sequence = sequence++, sessionId = sessionId,
-                        payload = ControlMessageCodec.encode(ControlMessage.Pong(message.timestampNs, message.pingSequence))))
-                    is ControlMessage.Pong -> Unit
-                    is ControlMessage.RttReport -> rttMs = message.rttMs.coerceAtLeast(0)
+                    is ControlMessage.Ping -> synchronized(socket) {
+                        ControlFraming.write(output, ControlFrame(
+                            type = ControlType.PONG, sequence = sequence.getAndIncrement(), sessionId = sessionId,
+                            payload = ControlMessageCodec.encode(ControlMessage.Pong(message.timestampNs, message.pingSequence))))
+                    }
+                    is ControlMessage.Pong -> rttState.acceptPong(message, System.nanoTime())
+                    is ControlMessage.RttReport -> rttState.acceptPhoneReport(message.rttMs)
                     is ControlMessage.Stop -> {
                         clearSession("Casting stopped")
                         break
@@ -368,9 +371,11 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         lastPliNs = now
         pliCount++
         try {
-            ControlFraming.write(s.getOutputStream(), ControlFrame(type = ControlType.PLI,
-                sequence = sequence++, sessionId = sessionId,
-                payload = ControlMessageCodec.encode(ControlMessage.Pli(reason))))
+            synchronized(s) {
+                ControlFraming.write(s.getOutputStream(), ControlFrame(type = ControlType.PLI,
+                    sequence = sequence.getAndIncrement(), sessionId = sessionId,
+                    payload = ControlMessageCodec.encode(ControlMessage.Pli(reason))))
+            }
         } catch (_: Exception) {}
     }
 
@@ -388,12 +393,13 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     private fun clearSession(message: String) {
         authenticated = false; authenticatedPeer = null; sessionId = 0L
         stream = null; csd = null; gate = DecodeGate(VideoCodec.AVC)
+        rttState.reset()
         stopDecoder()
         callbacks.onSessionIdle()
         callbacks.onStatus(message)
     }
 
-    fun telemetry(): String = "Rendered FPS: $renderedFps · TCP RTT: ${if (rttMs >= 0) "${rttMs}ms" else "n/a"} · UDP dropped: $dropped · PLI: $pliCount · ${"%.2f".format(liveMbps)} Mbps · $resolution · $decoderName"
+    fun telemetry(): String = "Rendered FPS: $renderedFps · TCP RTT: ${if (rttState.rttMs >= 0) "${rttState.rttMs}ms" else "n/a"} · UDP dropped: $dropped · PLI: $pliCount · ${"%.2f".format(liveMbps)} Mbps · $resolution · $decoderName"
 
     private fun telemetryLoop() {
         var previous = System.nanoTime()
@@ -401,6 +407,21 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         while (running.get()) {
             try { Thread.sleep(1000) } catch (_: InterruptedException) { }
             val now = System.nanoTime()
+            if (authenticated) {
+                val stamp = now
+                val pingSequence = sequence.getAndIncrement()
+                rttState.recordPing(stamp, pingSequence)
+                val peer = control
+                if (peer != null && !peer.isClosed) {
+                    try {
+                        synchronized(peer) {
+                            ControlFraming.write(peer.getOutputStream(), ControlFrame(
+                                type = ControlType.PING, sequence = pingSequence, sessionId = sessionId,
+                                payload = ControlMessageCodec.encode(ControlMessage.Ping(stamp, pingSequence))))
+                        }
+                    } catch (_: Exception) { }
+                }
+            }
             val elapsed = (now - previous).coerceAtLeast(1L)
             liveMbps = bytesRenderedWindow * 8.0 / elapsed * 1000.0
             renderedFps = rendered - previousRendered
