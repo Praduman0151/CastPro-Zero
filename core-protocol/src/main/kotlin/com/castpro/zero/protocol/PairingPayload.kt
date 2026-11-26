@@ -24,7 +24,7 @@ object PairingPayloadCodec {
     }
     private fun validate(v:TvPairingPayload) {
         require(v.version == 1)
-        require(v.ipAddress.length <= 45 && v.ipAddress.matches(Regex("[0-9a-fA-F:.]+"))) { "IP must be numeric literal" }
+        LocalAddressPolicy.requireAllowed(v.ipAddress)
         require(v.tcpPort in 1..65535 && v.udpPort in 1..65535)
         require(v.pairingToken.length in 16..128 && v.pairingToken.matches(Regex("[A-Za-z0-9_-]+")))
         require(v.expiryEpochSeconds > 0)
