@@ -32,6 +32,11 @@ class AuthenticatedLoopbackIntegrationTest {
                     val config = ControlFraming.read(input)!!
                     assertEquals(ControlType.STREAM_CONFIG, config.type)
                     assertEquals(sid, config.sessionId)
+                    val ping = ControlFraming.read(input)!!
+                    assertEquals(ControlType.PING, ping.type)
+                    ControlFraming.write(output, ControlFrame(ControlType.PONG, sequence = ping.sequence, sessionId = sid,
+                        payload = ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(),
+                            (ControlMessageCodec.decode(ping.type, ping.payload) as ControlMessage.Ping).pingSequence))))
                     val csdFrame = ControlFraming.read(input)!!
                     assertEquals(ControlType.VIDEO_CSD, csdFrame.type)
                     val gate = DecodeGate(VideoCodec.AVC)
@@ -72,6 +77,10 @@ class AuthenticatedLoopbackIntegrationTest {
                 ControlMessageCodec.typeOf(m), sequence = 2, sessionId = sid,
                 payload = ControlMessageCodec.encode(m)))
             send(ControlMessage.StreamConfig(1, 640, 360, 30, 10_000_000, 1, 3, 2))
+            send(ControlMessage.Ping(System.nanoTime(), 7))
+            val pong = ControlFraming.read(client.getInputStream())!!
+            assertEquals(ControlType.PONG, pong.type)
+            assertEquals(7L, (ControlMessageCodec.decode(pong.type, pong.payload) as ControlMessage.Pong).pingSequence)
             send(ControlMessage.VideoCsd(1, csd))
 
             val sender = DatagramSocket().apply { sendBufferSize = 2 * 1024 * 1024 }
