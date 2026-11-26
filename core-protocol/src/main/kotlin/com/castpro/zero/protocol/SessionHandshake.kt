@@ -35,8 +35,8 @@ object SessionHandshake {
         return sessionId
     }
 
-    fun client(socket: Socket, pairingToken: String, sessionId: Long = SessionIds.newSessionId()): Long {
-        LocalAddressPolicy.requireAllowed(socket.inetAddress.hostAddress ?: "")
+    fun client(socket: Socket, pairingToken: String, sessionId: Long = SessionIds.newSessionId(), allowLoopbackForTests: Boolean = false): Long {
+        requirePeer(socket.inetAddress, allowLoopbackForTests)
         socket.tcpNoDelay = true
         val input = socket.getInputStream()
         val output = socket.getOutputStream()
