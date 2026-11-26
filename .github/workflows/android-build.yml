@@ -8,7 +8,7 @@ concurrency:
   group: castpro-zero-ci-${{ github.ref }}
   cancel-in-progress: true
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     name: Unit tests and debug APKs
@@ -31,6 +31,15 @@ jobs:
           gradle-version: "8.13"
       - name: Generate official Gradle Wrapper
         run: gradle wrapper --gradle-version 8.13
+      - name: Commit canonical Gradle Wrapper files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gradlew gradlew.bat gradle/wrapper/gradle-wrapper.jar gradle/wrapper/gradle-wrapper.properties
+          if ! git diff --cached --quiet; then
+            git commit -m "build: add canonical Gradle Wrapper"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: Upload official Gradle Wrapper files
         uses: actions/upload-artifact@v4
         with:
