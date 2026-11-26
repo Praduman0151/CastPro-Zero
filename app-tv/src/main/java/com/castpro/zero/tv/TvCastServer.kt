@@ -58,7 +58,7 @@ class TvCastServer(private val status: (String) -> Unit = {}) {
             if (frame.type == ControlType.HELLO) {
                 sessionId = frame.sessionId
                 val ack = ControlMessage.HelloAck(true, ByteArray(16).also(SecureRandom()::nextBytes), 1)
-                ControlFraming.write(output, ControlFrame(ControlType.HELLO_ACK, sequence++, sessionId, ControlMessageCodec.encode(ack)))
+                ControlFraming.write(output, ControlFrame(type=ControlType.HELLO_ACK, sequence=sequence++, sessionId=sessionId, payload=ControlMessageCodec.encode(ack)))
                 continue
             }
             if (frame.sessionId != sessionId) continue
@@ -67,8 +67,8 @@ class TvCastServer(private val status: (String) -> Unit = {}) {
                 is ControlMessage.VideoCsd -> {
                     if (gate.onCsd(m.annexB)) { csd = m.annexB; decoder?.let { queueCsd(it, m.annexB) } }
                 }
-                is ControlMessage.Ping -> ControlFraming.write(output, ControlFrame(ControlType.PONG, sequence++, sessionId,
-                    ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(), m.pingSequence))))
+                is ControlMessage.Ping -> ControlFraming.write(output, ControlFrame(type=ControlType.PONG, sequence=sequence++, sessionId=sessionId,
+                    payload=ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(), m.pingSequence))))
                 is ControlMessage.Stop -> { stopDecoder(); status("Casting stopped") }
                 else -> Unit
             }
@@ -131,7 +131,7 @@ class TvCastServer(private val status: (String) -> Unit = {}) {
 
     private fun requestPli(reason: Int) {
         try { val s = control ?: return; ControlFraming.write(s.getOutputStream(),
-            ControlFrame(ControlType.PLI, sequence++, sessionId, ControlMessageCodec.encode(ControlMessage.Pli(reason)))) } catch (_: Exception) {}
+            ControlFrame(type=ControlType.PLI, sequence=sequence++, sessionId=sessionId, payload=ControlMessageCodec.encode(ControlMessage.Pli(reason)))) } catch (_: Exception) {}
     }
 
     fun onSurfaceRecreated(target: Surface) {
