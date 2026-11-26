@@ -53,8 +53,10 @@ class PhoneSessionPolicyTests {
 
 class PhoneDiscoveryParsingTests {
     @Test fun udpDiscoveryResponseUsesTheSameQrPayloadParser() {
-        val original = TvPairingPayload("TV", "192.168.1.9", 45670, 45671,
-            "abcdefghijklmnop1234", 5000)
+        val original = TvPairingPayload(
+            ipAddress = "192.168.1.9", tcpPort = 45670, udpPort = 45671,
+            pairingToken = "abcdefghijklmnop1234", expiryEpochSeconds = 5000
+        )
         val decoded = Discovery.decodeResponse(Discovery.encodeResponse(original), nowEpochSeconds = 4000)
         assertEquals(original, decoded)
     }
