@@ -149,7 +149,7 @@ class MainActivity : ComponentActivity() {
                                 if (open) requestCameraPermission.launch(Manifest.permission.CAMERA)
                                 else ui.value = ui.value.copy(scanner = false)
                             },
-                            onQr = { acceptQr(it) },
+                            onQr = { value -> runOnUiThread { acceptQr(value) } },
                             onStart = { validateAndStart() }
                         )
                     }

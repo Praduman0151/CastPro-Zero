@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.util.Log
 import com.castpro.zero.protocol.Discovery
+import com.castpro.zero.protocol.LocalAddressPolicy
 import com.castpro.zero.protocol.ProtocolException
 import com.castpro.zero.protocol.TvPairingPayload
 import java.net.DatagramPacket
@@ -46,6 +47,7 @@ class PhoneDiscovery(
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
+                if (!LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) continue
                 val response = String(packet.data, 0, packet.length, Charsets.UTF_8)
                 val payload = Discovery.decodeResponse(response, System.currentTimeMillis() / 1000)
                 onDevice(payload)

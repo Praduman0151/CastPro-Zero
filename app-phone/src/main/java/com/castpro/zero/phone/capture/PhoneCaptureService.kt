@@ -165,10 +165,6 @@ class PhoneCaptureService : Service() {
                         view.get(data)
                         val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                         val isKeyframe = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                        if (!isConfig && !firstFrameLogged) {
-                            firstFrameLogged = true
-                            Log.i(TAG, "First encoder output from ${enc.name}")
-                        }
                         if (isConfig) {
                             val sets = AnnexB.extract(data, VideoCodec.AVC)
                             if (sets != null) sender?.sendCsd(1, sets.annexB())
@@ -181,6 +177,10 @@ class PhoneCaptureService : Service() {
                             // Every encoded access unit is sent; no drop path exists.
                             val sent = sender?.sendVideoFrame(data, isKeyframe, info.presentationTimeUs * 1_000L)
                                 ?: error("Sender transport unavailable")
+                            if (!firstFrameLogged) {
+                                firstFrameLogged = true
+                                Log.i(TAG, "First transmitted frame from ${enc.name} at ${info.presentationTimeUs}us")
+                            }
                             if (frameLogCount < 10) {
                                 frameLogCount++
                                 val nalTypes = AnnexB.nalUnits(data).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
@@ -214,7 +214,7 @@ class PhoneCaptureService : Service() {
                 }
             }
         }
-        if (active.get()) Handler(mainLooper).post { stopCapture() }
+        if (!stopping.get()) Handler(mainLooper).post { stopCapture() }
     }
 
     private fun statsLoop(enc: MediaCodec) {
