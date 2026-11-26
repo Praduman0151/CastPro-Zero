@@ -26,6 +26,7 @@ class AuthenticatedLoopbackIntegrationTest {
         val server = Thread {
             try {
                 tcpServer.accept().use { peer ->
+                    peer.soTimeout = 5_000
                     val sid = SessionHandshake.server(peer, token, allowLoopbackForTests = true)
                     val input = peer.getInputStream()
                     val output = peer.getOutputStream()
@@ -71,6 +72,7 @@ class AuthenticatedLoopbackIntegrationTest {
         server.start()
 
         Socket(loopback, tcpServer.localPort).use { client ->
+            client.soTimeout = 5_000
             val sid = SessionHandshake.client(client, token, allowLoopbackForTests = true)
             val output = client.getOutputStream()
             fun send(m: ControlMessage) = ControlFraming.write(output, ControlFrame(
