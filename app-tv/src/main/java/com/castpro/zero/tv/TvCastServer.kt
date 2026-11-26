@@ -12,7 +12,7 @@ import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.ceil
 
-class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingToken: String = createPairingToken()) {
+class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val pairingToken: String = createPairingToken()) {
     interface Callbacks {
         fun onStatus(value: String) {}
         fun onAddress(ip: String, token: String) {}
@@ -67,9 +67,7 @@ class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingTo
     fun refreshNetwork() {
         try { tcpServer?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
-        try { discovery?.close() } catch (_: Exception) {}
         try { control?.close() } catch (_: Exception) {}
-        discoveryStarted = false
     }
 
     private data class LanAddress(val address: Inet4Address, val broadcast: Inet4Address?)
@@ -100,7 +98,7 @@ class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingTo
                 tcpServer = tcp; udp = video
                 callbacks.onAddress(ip, pairingToken)
                 callbacks.onStatus("Receiver ready · $ip")
-                startDiscoveryResponder(lan)
+                startDiscoveryResponder()
                 Thread({ receiveVideo(video) }, "CPZ-TV-udp").start()
                 while (running.get() && !tcp.isClosed) {
                     try { handle(tcp.accept()) }
@@ -120,18 +118,23 @@ class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingTo
         }
     }
 
-    private fun startDiscoveryResponder(lan: LanAddress) {
+    private fun startDiscoveryResponder() {
         if (discoveryStarted) return
         discoveryStarted = true
         Thread({
+            var localSocket: DatagramSocket? = null
             try {
                 val socket = DatagramSocket(null).apply { reuseAddress = true; broadcast = true; bind(InetSocketAddress(DISCOVERY_PORT)) }
+                localSocket = socket
                 discovery = socket
                 while (running.get()) {
+                    val lan = privateAddress()
+                    if (lan == null) { Thread.sleep(1000); continue }
+                    val ip = lan.address.hostAddress
+                    if (ip == null) { Thread.sleep(1000); continue }
                     val payload = TvDiscoveryPacketCodec.encode(TvDiscoveryPacket(
                         name = Build.MODEL ?: "CastPro-Zero TV",
-                        ipAddress = lan.address.hostAddress ?: return@Thread,
-                        tcpPort = TCP_PORT, udpPort = UDP_PORT, pairingToken = pairingToken,
+                        ipAddress = ip, tcpPort = TCP_PORT, udpPort = UDP_PORT, pairingToken = pairingToken,
                         expiryEpochSeconds = System.currentTimeMillis() / 1000L + 3600L
                     ))
                     val broadcastAddress = lan.broadcast ?: InetAddress.getByName("255.255.255.255")
@@ -140,7 +143,11 @@ class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingTo
                 }
             } catch (e: Exception) {
                 if (running.get()) Log.w("CPZ-TV", "Discovery responder unavailable", e)
-            } finally { discoveryStarted = false; try { discovery?.close() } catch (_: Exception) {} }
+            } finally {
+                discoveryStarted = false
+                try { localSocket?.close() } catch (_: Exception) {}
+                if (discovery === localSocket) discovery = null
+            }
         }, "CPZ-TV-discovery").start()
     }
 
@@ -160,6 +167,10 @@ class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingTo
                     is ControlMessage.StreamConfig -> {
                         if (message.codec != 1 || message.width !in 1..8192 || message.height !in 1..8192) {
                             Log.w("CPZ-TV", "Rejected invalid stream config"); continue
+                        }
+                        val previous = stream
+                        if (previous != null && (previous.width != message.width || previous.height != message.height || previous.codec != message.codec)) {
+                            stopDecoder(); csd = null; gate = DecodeGate(VideoCodec.AVC)
                         }
                         stream = message; resolution = "${message.width}×${message.height}"
                         callbacks.onStreamConfig(message); configureDecoderIfReady()
@@ -250,11 +261,18 @@ class TvCastServer(private val callbacks: Callbacks = Callbacks(), val pairingTo
                 val format = codec.outputFormat
                 val width = format.getInteger(MediaFormat.KEY_WIDTH)
                 val height = format.getInteger(MediaFormat.KEY_HEIGHT)
-                val crop = if (format.containsKey("crop-left"))
-                    " crop=${format.getInteger("crop-left")},${format.getInteger("crop-top")}-${format.getInteger("crop-right")},${format.getInteger("crop-bottom")}" else ""
+                val hasCrop = format.containsKey("crop-left") && format.containsKey("crop-right") &&
+                    format.containsKey("crop-top") && format.containsKey("crop-bottom")
+                val cropLeft = if (hasCrop) format.getInteger("crop-left") else 0
+                val cropTop = if (hasCrop) format.getInteger("crop-top") else 0
+                val cropRight = if (hasCrop) format.getInteger("crop-right") else width - 1
+                val cropBottom = if (hasCrop) format.getInteger("crop-bottom") else height - 1
+                val displayWidth = (cropRight - cropLeft + 1).coerceAtLeast(1)
+                val displayHeight = (cropBottom - cropTop + 1).coerceAtLeast(1)
+                val crop = if (hasCrop) " crop=$cropLeft,$cropTop-$cropRight,$cropBottom" else ""
                 Log.i("CPZ-TV", "INFO_OUTPUT_FORMAT_CHANGED width=$width height=$height$crop color-format=${if (format.containsKey(MediaFormat.KEY_COLOR_FORMAT)) format.getInteger(MediaFormat.KEY_COLOR_FORMAT) else -1}")
-                resolution = "$width×$height"
-                callbacks.onStreamConfig((stream ?: return).copy(width = width, height = height))
+                resolution = "$displayWidth×$displayHeight"
+                callbacks.onStreamConfig((stream ?: return).copy(width = displayWidth, height = displayHeight))
             }
         }
     }

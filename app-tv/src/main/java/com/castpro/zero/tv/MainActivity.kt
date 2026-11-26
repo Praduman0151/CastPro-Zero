@@ -5,10 +5,8 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Bundle
 import android.view.KeyEvent
-import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -42,7 +40,14 @@ class MainActivity : ComponentActivity() {
     private var streamHeight by mutableIntStateOf(9)
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) { if (::receiver.isInitialized) receiver.refreshNetwork() }
-        override fun onLost(network: Network) { if (::receiver.isInitialized) receiver.refreshNetwork() }
+        override fun onLost(network: Network) {
+            runOnUiThread {
+                ipAddress = null
+                qr = null
+                address = "Searching for private Wi-Fi / Ethernet…"
+            }
+            if (::receiver.isInitialized) receiver.refreshNetwork()
+        }
         override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) {
             if (::receiver.isInitialized) receiver.refreshNetwork()
         }
