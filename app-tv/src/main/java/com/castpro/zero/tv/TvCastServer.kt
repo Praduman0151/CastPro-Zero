@@ -11,14 +11,15 @@ import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Local-only control listener and UDP receiver. */
-class TvCastServer(private val status: (String) -> Unit = {}) {
+class TvCastServer(private val status: (String) -> Unit = {}, val pairingToken: String = createPairingToken()) {
     private val running = AtomicBoolean(false)
     private var tcpServer: ServerSocket? = null
     private var udp: DatagramSocket? = null
     private var control: Socket? = null
     private var decoder: MediaCodec? = null
     private var surface: Surface? = null
-    private var sessionId = 0L
+    @Volatile private var sessionId = 0L
+    @Volatile private var authenticated = false
     private var sequence = 0L
     private var csd: ByteArray? = null
     private var stream: ControlMessage.StreamConfig? = null
@@ -50,28 +51,44 @@ class TvCastServer(private val status: (String) -> Unit = {}) {
     }
 
     private fun handle(socket: Socket) {
-        control = socket
-        socket.tcpNoDelay = true
-        val input = socket.getInputStream(); val output = socket.getOutputStream()
-        while (running.get() && !socket.isClosed) {
-            val frame = ControlFraming.read(input) ?: break
-            if (frame.type == ControlType.HELLO) {
-                sessionId = frame.sessionId
-                val ack = ControlMessage.HelloAck(true, ByteArray(16).also(SecureRandom()::nextBytes), 1)
-                ControlFraming.write(output, ControlFrame(type=ControlType.HELLO_ACK, sequence=sequence++, sessionId=sessionId, payload=ControlMessageCodec.encode(ack)))
-                continue
-            }
-            if (frame.sessionId != sessionId) continue
-            when (val m = ControlMessageCodec.decode(frame.type, frame.payload)) {
-                is ControlMessage.StreamConfig -> { stream = m; configureDecoder() }
-                is ControlMessage.VideoCsd -> {
-                    if (gate.onCsd(m.annexB)) { csd = m.annexB; decoder?.let { queueCsd(it, m.annexB) } }
+        try {
+            val sid = SessionHandshake.server(socket, pairingToken)
+            control = socket
+            sessionId = sid
+            authenticated = true
+            status("Authenticated phone session " + java.lang.Long.toUnsignedString(sid))
+            val input = socket.getInputStream()
+            val output = socket.getOutputStream()
+            while (running.get() && !socket.isClosed && authenticated) {
+                val frame = ControlFraming.read(input) ?: break
+                if (frame.sessionId != sessionId) continue
+                when (val message = ControlMessageCodec.decode(frame.type, frame.payload)) {
+                    is ControlMessage.StreamConfig -> { stream = message; configureDecoder() }
+                    is ControlMessage.VideoCsd -> {
+                        if (message.codec == 1 && gate.onCsd(message.annexB)) {
+                            csd = message.annexB
+                            decoder?.let { queueCsd(it, message.annexB) }
+                        }
+                    }
+                    is ControlMessage.Ping -> ControlFraming.write(output, ControlFrame(
+                        type = ControlType.PONG, sequence = sequence++, sessionId = sessionId,
+                        payload = ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(), message.pingSequence))))
+                    is ControlMessage.Stop -> {
+                        authenticated = false
+                        sessionId = 0L
+                        stream = null; csd = null; gate = DecodeGate(VideoCodec.AVC)
+                        stopDecoder(); status("Casting stopped")
+                        break
+                    }
+                    else -> Unit
                 }
-                is ControlMessage.Ping -> ControlFraming.write(output, ControlFrame(type=ControlType.PONG, sequence=sequence++, sessionId=sessionId,
-                    payload=ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(), m.pingSequence))))
-                is ControlMessage.Stop -> { stopDecoder(); status("Casting stopped") }
-                else -> Unit
             }
+        } catch (e: Exception) {
+            if (running.get()) Log.w("CPZ-TV", "Unauthenticated or disconnected peer", e)
+        } finally {
+            authenticated = false
+            if (control === socket) control = null
+            try { socket.close() } catch (_: Exception) {}
         }
     }
 
@@ -109,11 +126,15 @@ class TvCastServer(private val status: (String) -> Unit = {}) {
 
     private fun receiveVideo() {
         val socket = udp ?: return
-        val reassembler = VideoReassembler(sessionId)
+        var reassembler: VideoReassembler? = null
         val bytes = ByteArray(1360)
         while (running.get()) try {
             val packet = DatagramPacket(bytes, bytes.size); socket.receive(packet)
-            val result = reassembler.accept(packet.data.copyOf(packet.length), System.nanoTime())
+            if (!authenticated) continue
+            val activeReassembler = reassembler ?: VideoReassembler(sessionId).also { reassembler = it }
+            val fragment = try { VideoFragment.decode(packet.data.copyOf(packet.length)) } catch (_: Exception) { dropped++; continue }
+            if (fragment.sessionId != sessionId) { dropped++; continue }
+            val result = activeReassembler.accept(packet.data.copyOf(packet.length), System.nanoTime())
             dropped += result.dropped
             if (result.requestPli) requestPli(1)
             result.frames.forEach { frame ->
@@ -147,9 +168,16 @@ class TvCastServer(private val status: (String) -> Unit = {}) {
     private fun stopDecoder() { try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}; decoder = null }
     fun stop() {
         running.set(false)
+        authenticated = false
+        sessionId = 0L
         try { tcpServer?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
         try { control?.close() } catch (_: Exception) {}
         stopDecoder()
+    }
+
+    companion object {
+        private fun createPairingToken(): String = ByteArray(24).also(SecureRandom()::nextBytes)
+            .let { java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
     }
 }
