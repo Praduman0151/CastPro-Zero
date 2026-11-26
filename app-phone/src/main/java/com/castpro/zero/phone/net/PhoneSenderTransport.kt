@@ -23,6 +23,7 @@ class PhoneSenderTransport(
     private var sessionId: Long = 0
     private var sequence = 2L
     private var frameId = 0L
+    @Volatile private var pingThread: Thread? = null
     @Volatile private var cachedCsd: Pair<Int, ByteArray>? = null
 
     @Synchronized fun connect(): Long {
@@ -35,6 +36,13 @@ class PhoneSenderTransport(
             val video = DatagramSocket().apply { sendBufferSize = 2 * 1024 * 1024 }
             tcp = control; udp = video; sessionId = sid; running.set(true)
             Thread({ readControl() }, "CPZ-phone-control").start()
+            pingThread = Thread({
+                var pingSequence = 0L
+                while (running.get()) {
+                    try { sendPing(pingSequence++) } catch (_: Exception) { break }
+                    try { Thread.sleep(1_000) } catch (_: InterruptedException) { break }
+                }
+            }, "CPZ-phone-ping").also { it.start() }
             return sid
         } catch (t: Throwable) { control.close(); throw t }
     }
@@ -92,6 +100,7 @@ class PhoneSenderTransport(
 
     override fun close() {
         if (!running.getAndSet(false)) return
+        pingThread?.interrupt(); pingThread = null
         try { tcp?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
         tcp = null; udp = null
