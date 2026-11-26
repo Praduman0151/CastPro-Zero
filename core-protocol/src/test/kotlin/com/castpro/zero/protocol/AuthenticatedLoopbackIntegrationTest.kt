@@ -35,7 +35,7 @@ class AuthenticatedLoopbackIntegrationTest {
                     val ping = ControlFraming.read(input)!!
                     assertEquals(ControlType.PING, ping.type)
                     ControlFraming.write(output, ControlFrame(ControlType.PONG, sequence = ping.sequence, sessionId = sid,
-                        payload = ControlMessageCodec.encode(ControlMessage.Pong(System.nanoTime(),
+                        payload = ControlMessageCodec.encode(ControlMessage.Pong((ControlMessageCodec.decode(ping.type, ping.payload) as ControlMessage.Ping).timestampNs,
                             (ControlMessageCodec.decode(ping.type, ping.payload) as ControlMessage.Ping).pingSequence))))
                     val csdFrame = ControlFraming.read(input)!!
                     assertEquals(ControlType.VIDEO_CSD, csdFrame.type)
