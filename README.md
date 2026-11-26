@@ -1,9 +1,8 @@
 # CastPro-Zero
 
-Clean-slate offline-first phone-to-TV casting project.
+Clean-slate offline-first phone-to-TV casting project. The TCL TV is the TCP control server, UDP video receiver, and QR display; the OnePlus phone is the QR scanner and sender.
 
-Milestone 1A: protocol foundation, Android shells, tests, and CI.
+- [Protocol v1](docs/PROTOCOL.md)
+- [Milestones](docs/MILESTONES.md)
 
-The TCL TV is the pairing/control server and UDP video receiver. The phone is the QR scanner and sender.
-
-See `docs/` for the protocol and milestone specifications.
+Milestone 1A contains the protocol foundation, Android shells, unit tests, and CI. Live MediaProjection/codec/SurfaceView streaming is deliberately deferred to Milestone 1B.

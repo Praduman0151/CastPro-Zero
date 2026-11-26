@@ -1,0 +1,42 @@
+name: CastPro-Zero Android CI
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Unit tests and debug APKs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+      - name: Generate official Gradle Wrapper
+        run: gradle wrapper --gradle-version 8.13
+      - name: Run unit tests and build both APKs
+        run: ./gradlew :core-protocol:test :app-phone:testDebugUnitTest :app-tv:testDebugUnitTest :app-phone:assembleDebug :app-tv:assembleDebug
+      - name: Upload phone APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-phone-debug.apk
+          path: app-phone/build/outputs/apk/debug/app-phone-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload TV APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-tv-debug.apk
+          path: app-tv/build/outputs/apk/debug/app-tv-debug.apk
+          if-no-files-found: error
+          retention-days: 30
