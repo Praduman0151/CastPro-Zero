@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.Process
 import android.util.Log
 import android.view.Surface
@@ -58,7 +59,14 @@ class PhoneCaptureService : Service() {
     private var statsThread: Thread? = null
     private val active = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
+    private val reconfiguring = AtomicBoolean(false)
+    private val codecLock = Any()
     private val telemetry = SenderTelemetryState()
+    private var abrController: AdaptiveBitrateController? = null
+    private var powerManager: PowerManager? = null
+    private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
+    @Volatile private var thermalLevel = 0
+    @Volatile private var lastTxCongestionCount = 0L
     private val startup = OffThreadStartup(
         Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "CPZ-capture-startup") }
     )
@@ -126,6 +134,7 @@ class PhoneCaptureService : Service() {
                         telemetry.onRtt(measured)?.let(PhoneSessionBus::publish)
                     },
                     onSyncFrameRequest = { requestEncoderSyncFrame(codec) },
+                    onHealthFeedback = { feedback -> handleHealthFeedback(feedback) },
                     binding = binding
                 ).also { it.connect() }
                 if (stopping.get()) { teardown(); return@execute }
@@ -145,6 +154,9 @@ class PhoneCaptureService : Service() {
                         }
                     }
                 }, Handler(mainLooper))
+                abrController = AdaptiveBitrateController(requestedBitrate)
+                lastTxCongestionCount = 0L
+                registerThermalListener()
                 startEncoder(requestedBitrate)
                 if (stopping.get()) { teardown(); return@execute }
                 val current = sender
@@ -176,18 +188,18 @@ class PhoneCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startEncoder(bitrate: Int) {
-        val wifi = getSystemService(WifiManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun startEncoder(bitrate: Int, targetWidth: Int = WIDTH, targetHeight: Int = HEIGHT) {
+        if (wifiLock == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val wifi = getSystemService(WifiManager::class.java)
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "CPZ-low-latency")
                 .also { it.acquire() }
         }
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         val caps = enc.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
         val aligned = if (caps != null) {
-            EncoderFormatPolicy.alignedDimensions(caps, WIDTH, HEIGHT)
+            EncoderFormatPolicy.alignedDimensions(caps, targetWidth, targetHeight)
         } else {
-            EncoderFormatPolicy.Dimensions(WIDTH, HEIGHT)
+            EncoderFormatPolicy.Dimensions(targetWidth, targetHeight)
         }
         activeWidth = aligned.width
         activeHeight = aligned.height
@@ -195,14 +207,20 @@ class PhoneCaptureService : Service() {
             enc, EncoderFormatPolicy.specsFor(aligned.width, aligned.height, bitrate, FPS)
         )
         codec = enc
-        surface = enc.createInputSurface()
+        val newSurface = enc.createInputSurface()
+        surface = newSurface
         enc.start()
         Log.i(TAG, "Encoder started: ${enc.name} tier=${appliedSpec.tier} at ${aligned.width}x${aligned.height}@${FPS}, ${bitrate / 1_000_000} Mbps")
-        // Exactly one VirtualDisplay is created; resizing goes through resize().
-        display = projection?.createVirtualDisplay(
-            "CastPro-Zero", aligned.width, aligned.height, resources.displayMetrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null
-        )
+        val existingDisplay = display
+        if (existingDisplay == null) {
+            display = projection?.createVirtualDisplay(
+                "CastPro-Zero", aligned.width, aligned.height, resources.displayMetrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, newSurface, null, null
+            )
+        } else {
+            existingDisplay.resize(aligned.width, aligned.height, resources.displayMetrics.densityDpi)
+            existingDisplay.setSurface(newSurface)
+        }
         sender?.sendStreamConfig(
             ControlMessage.StreamConfig(1, aligned.width, aligned.height, FPS, bitrate, 1, 3, 2)
         )
@@ -214,7 +232,90 @@ class PhoneCaptureService : Service() {
         PhoneSessionBus.publishStreaming(true)
         txThread = Thread({ txLoop(enc, queue) }, "CPZ-video-tx").also { it.start() }
         drainThread = Thread({ drain(enc, queue) }, "CPZ-encoder-drain").also { it.start() }
-        statsThread = Thread({ statsLoop(enc) }, "CPZ-phone-stats").also { it.start() }
+        if (statsThread == null) {
+            statsThread = Thread({ statsLoop() }, "CPZ-phone-stats").also { it.start() }
+        }
+    }
+
+    private fun registerThermalListener() {
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        powerManager = pm
+        updateThermalStatus(pm.currentThermalStatus)
+        val listener = PowerManager.OnThermalStatusChangedListener { status ->
+            updateThermalStatus(status)
+        }
+        thermalListener = listener
+        pm.addThermalStatusListener(listener)
+    }
+
+    private fun updateThermalStatus(status: Int) {
+        thermalLevel = when {
+            status >= PowerManager.THERMAL_STATUS_SEVERE -> 2
+            status >= PowerManager.THERMAL_STATUS_MODERATE -> 1
+            else -> 0
+        }
+        if (thermalLevel >= 1) {
+            Log.w(TAG, "Thermal status changed: status=$status level=$thermalLevel")
+        }
+        if (thermalLevel >= 2) {
+            handleHealthFeedback(ControlMessage.HealthFeedback(0, 0, FPS, 0))
+        }
+    }
+
+    private fun handleHealthFeedback(feedback: ControlMessage.HealthFeedback) {
+        val controller = abrController ?: return
+        val transport = sender ?: return
+        val congestionNow = transport.congestionDropCount()
+        val congestionDelta = (congestionNow - lastTxCongestionCount).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+        lastTxCongestionCount = congestionNow
+        val decision = controller.evaluate(
+            HealthSample(
+                nowNs = System.nanoTime(),
+                rttMs = transport.stats().rttMs,
+                lossDelta = feedback.reassemblyDropsDelta,
+                backpressureDelta = feedback.backpressureDropsDelta,
+                txCongestionDropsDelta = congestionDelta,
+                thermalLevel = thermalLevel
+            )
+        )
+        if (decision.resolutionChanged) {
+            startup.execute { reconfigureResolution(decision.targetProfile, decision.targetBitrateBps) }
+        } else if (decision.bitrateChanged) {
+            try {
+                codec?.setParameters(Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, decision.targetBitrateBps)
+                })
+                Log.i(TAG, "ABR adjusted bitrate=${decision.targetBitrateBps / 1_000_000.0} Mbps")
+            } catch (e: Exception) {
+                Log.w(TAG, "ABR bitrate update failed", e)
+            }
+        }
+    }
+
+    private fun reconfigureResolution(profile: ResolutionProfile, bitrate: Int) = synchronized(codecLock) {
+        if (stopping.get() || projection == null) return@synchronized
+        reconfiguring.set(true)
+        try {
+            active.set(false)
+            frameQueue?.close()
+            frameQueue = null
+            listOf(drainThread, txThread).forEach { thread ->
+                thread?.interrupt()
+                try { thread?.join(400) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+            }
+            drainThread = null; txThread = null
+            try { codec?.stop(); codec?.release() } catch (_: Exception) {}
+            codec = null
+            try { surface?.release() } catch (_: Exception) {}
+            surface = null
+            startEncoder(bitrate, profile.width, profile.height)
+            Log.i(TAG, "ABR switched resolution to ${profile.width}x${profile.height} @ ${bitrate / 1_000_000.0} Mbps")
+        } catch (e: Exception) {
+            Log.e(TAG, "Resolution reconfiguration failed", e)
+            stopCaptureAsync()
+        } finally {
+            reconfiguring.set(false)
+        }
     }
 
     private fun drain(enc: MediaCodec, queue: BoundedFrameQueue) {
@@ -296,7 +397,7 @@ class PhoneCaptureService : Service() {
                 }
             }
         }
-        if (!stopping.get()) stopCaptureAsync()
+        if (!stopping.get() && !reconfiguring.get()) stopCaptureAsync()
     }
 
     private fun txLoop(enc: MediaCodec, queue: BoundedFrameQueue) {
@@ -338,7 +439,7 @@ class PhoneCaptureService : Service() {
                 framePool.release(frame.buffer)
             }
         }
-        if (!stopping.get()) stopCaptureAsync()
+        if (!stopping.get() && !reconfiguring.get()) stopCaptureAsync()
     }
 
     private fun requestEncoderSyncFrame(enc: MediaCodec?) {
@@ -351,22 +452,23 @@ class PhoneCaptureService : Service() {
         }
     }
 
-    private fun statsLoop(enc: MediaCodec) {
+    private fun statsLoop() {
         var last = System.nanoTime()
         var lastFrames = 0L
         var lastBytes = 0L
-        while (active.get()) {
+        while (!stopping.get()) {
             try { Thread.sleep(500) } catch (_: InterruptedException) { break }
             val now = System.nanoTime()
             val elapsed = (now - last).coerceAtLeast(1)
             val transport = sender ?: continue
+            val encName = codec?.name ?: "video/avc"
             val snapshot = transport.stats()
             val fps = ((snapshot.framesSent - lastFrames) * 1_000_000_000L / elapsed).toInt()
             val mbps = ((snapshot.bytesSent - lastBytes) * 8_000f / elapsed)
             last = now
             lastFrames = snapshot.framesSent
             lastBytes = snapshot.bytesSent
-            PhoneSessionBus.publish(telemetry.publishMeasured(transport.stats(fps, mbps, enc.name).copy(
+            PhoneSessionBus.publish(telemetry.publishMeasured(transport.stats(fps, mbps, encName).copy(
                 resolution = "${activeWidth}×${activeHeight}", audioActive = audio?.isActive() == true
             )))
         }
@@ -390,6 +492,12 @@ class PhoneCaptureService : Service() {
     @Synchronized
     private fun teardown() {
         active.set(false)
+        thermalListener?.let { listener ->
+            try { powerManager?.removeThermalStatusListener(listener) } catch (_: Exception) {}
+        }
+        thermalListener = null
+        powerManager = null
+        abrController = null
         frameQueue?.close()
         frameQueue = null
         listOf(drainThread, txThread, statsThread).forEach { thread ->

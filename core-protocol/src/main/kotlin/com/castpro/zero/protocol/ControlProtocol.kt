@@ -12,7 +12,7 @@ private val CONTROL_MAGIC = byteArrayOf(0x43, 0x50, 0x5A, 0x30)
 
 enum class ControlType(val id: Int) {
     HELLO(1), HELLO_ACK(2), PAIR_CONFIRM(3), STREAM_CONFIG(16), VIDEO_CSD(17),
-    PING(32), PONG(33), PLI(34), STOP(35), RTT_REPORT(36), AUDIO_CONFIG(37), FRAGMENT_NACK(38), ERROR(127);
+    PING(32), PONG(33), PLI(34), STOP(35), RTT_REPORT(36), AUDIO_CONFIG(37), FRAGMENT_NACK(38), HEALTH_FEEDBACK(39), ERROR(127);
     companion object {
         fun fromId(id: Int): ControlType = entries.firstOrNull { it.id == id }
             ?: throw ProtocolException("Unknown control message type: $id")

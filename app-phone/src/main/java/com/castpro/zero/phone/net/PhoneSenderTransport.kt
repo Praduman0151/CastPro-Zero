@@ -49,6 +49,7 @@ class PhoneSenderTransport(
     private val onPli: () -> Unit,
     private val onRtt: (Long) -> Unit = {},
     private val onSyncFrameRequest: () -> Unit = {},
+    private val onHealthFeedback: (ControlMessage.HealthFeedback) -> Unit = {},
     private val binding: LocalNetworkBinding? = null
 ) : AutoCloseable {
     private val running = AtomicBoolean(false)
@@ -68,6 +69,7 @@ class PhoneSenderTransport(
     private val bytesSent = AtomicLong()
     private val pliCount = AtomicLong()
     private val audioFramesSent = AtomicLong()
+    private val txCongestionDrops = AtomicLong()
     @Volatile private var rttMs = -1L
     @Volatile private var cachedCsd: Pair<Int, ByteArray>? = null
     @Volatile private var pingThread: Thread? = null
@@ -186,7 +188,9 @@ class PhoneSenderTransport(
             try {
                 socket.send(packet)
             } catch (e: Exception) {
-                return@synchronized SendOutcome.NotSent(SendFailurePolicy.classify(e), e)
+                val failure = SendFailurePolicy.classify(e)
+                if (failure == SendFailure.TRANSIENT_CONGESTION) txCongestionDrops.incrementAndGet()
+                return@synchronized SendOutcome.NotSent(failure, e)
             }
             bytesSent.addAndGet(data.size.toLong())
             if (pacing.pauseMicros > 0 && (index + 1) % pacing.burstSize == 0 && index + 1 < fragments.size) {
@@ -262,6 +266,7 @@ class PhoneSenderTransport(
                         onPli()
                     }
                     is ControlMessage.FragmentNack -> retransmitMissing(message.frameId, message.missingIndices)
+                    is ControlMessage.HealthFeedback -> onHealthFeedback(message)
                     is ControlMessage.Ping -> sendControl(ControlMessage.Pong(message.timestampNs, message.pingSequence))
                     is ControlMessage.Pong -> {
                         val measured = (System.nanoTime() - message.timestampNs).coerceAtLeast(0) / 1_000_000
@@ -276,6 +281,8 @@ class PhoneSenderTransport(
         } catch (_: Exception) { /* Socket teardown ends the control reader. */ }
         finally { close() }
     }
+
+    fun congestionDropCount(): Long = txCongestionDrops.get()
 
     fun stats(fps: Int = 0, mbps: Float = 0f, codec: String = "video/avc") = SenderStats(
         framesSent = framesSent.get(),

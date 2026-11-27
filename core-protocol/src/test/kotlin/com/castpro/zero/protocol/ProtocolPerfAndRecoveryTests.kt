@@ -66,6 +66,9 @@ class ProtocolPerfAndRecoveryTests {
         val decoded = ControlMessageCodec.decode(ControlType.FRAGMENT_NACK, encoded)
         assertEquals(msg, decoded)
 
+        val fb = ControlMessage.HealthFeedback(reassemblyDropsDelta = 2, backpressureDropsDelta = 1, renderedFps = 59, tvPipelineMs = 14)
+        assertEquals(fb, ControlMessageCodec.decode(ControlType.HEALTH_FEEDBACK, ControlMessageCodec.encode(fb)))
+
         var writeCalls = 0
         val out = object : ByteArrayOutputStream() {
             override fun write(b: ByteArray, off: Int, len: Int) {

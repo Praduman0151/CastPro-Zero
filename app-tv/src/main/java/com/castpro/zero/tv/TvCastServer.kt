@@ -938,6 +938,8 @@ class TvCastServer(
 
     private fun telemetryLoop() {
         var previous = System.nanoTime()
+        var lastLoss = 0L
+        var lastBusy = 0L
         while (running.get()) {
             try {
                 Thread.sleep(1000)
@@ -945,16 +947,32 @@ class TvCastServer(
                 if (!running.get()) break
             }
             val now = System.nanoTime()
-            if (authenticated) {
-                val pingSequence = sequence.getAndIncrement()
-                rttState.recordPing(now, pingSequence)
-                controlSendQueue.offer(ControlMessage.Ping(now, pingSequence))
-            }
             val elapsed = (now - previous).coerceAtLeast(1L)
             val bytesWindow = bytesRenderedWindow.getAndSet(0L)
             liveMbps = bytesWindow * 8.0 / elapsed * 1000.0
             renderedFps = fpsTracker.sampleFps(previous, now)
             previous = now
+            if (authenticated) {
+                val pingSequence = sequence.getAndIncrement()
+                rttState.recordPing(now, pingSequence)
+                controlSendQueue.offer(ControlMessage.Ping(now, pingSequence))
+                val snap = health.snapshot()
+                val lossDelta = (snap.reassemblyDrops - lastLoss).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                val busyDelta = (snap.backpressureDrops - lastBusy).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                lastLoss = snap.reassemblyDrops
+                lastBusy = snap.backpressureDrops
+                controlSendQueue.offer(
+                    ControlMessage.HealthFeedback(
+                        reassemblyDropsDelta = lossDelta,
+                        backpressureDropsDelta = busyDelta,
+                        renderedFps = renderedFps.toInt(),
+                        tvPipelineMs = tvLocalPipelineMs.toInt()
+                    )
+                )
+            } else {
+                lastLoss = 0L
+                lastBusy = 0L
+            }
             callbacks.onTelemetry(telemetry())
         }
     }

@@ -20,6 +20,8 @@ sealed interface ControlMessage {
     data class AudioConfig(val sampleRateHz:Int,val channelCount:Int,val bitDepth:Int,val encoding:Int):ControlMessage
     /** Selective retransmission request for missing UDP video fragments of a recent frame. */
     data class FragmentNack(val frameId:Long,val missingIndices:List<Int>):ControlMessage
+    /** Receiver-measured loss, decoder backpressure, FPS, and decode latency feedback for ABR. */
+    data class HealthFeedback(val reassemblyDropsDelta:Int,val backpressureDropsDelta:Int,val renderedFps:Int,val tvPipelineMs:Int):ControlMessage
     data class Error(val code:Int,val message:String):ControlMessage
 }
 
@@ -37,6 +39,7 @@ object ControlMessageCodec {
         is ControlMessage.RttReport->ControlType.RTT_REPORT
         is ControlMessage.AudioConfig->ControlType.AUDIO_CONFIG
         is ControlMessage.FragmentNack->ControlType.FRAGMENT_NACK
+        is ControlMessage.HealthFeedback->ControlType.HEALTH_FEEDBACK
         is ControlMessage.Error->ControlType.ERROR
     }
     fun encode(m:ControlMessage):ByteArray {
@@ -59,6 +62,7 @@ object ControlMessageCodec {
                 m.missingIndices.forEach { buf.putShort(it.toShort()) }
                 buf.array()
             }
+            is ControlMessage.HealthFeedback->ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN).putInt(m.reassemblyDropsDelta).putInt(m.backpressureDropsDelta).putInt(m.renderedFps).putInt(m.tvPipelineMs).array()
             is ControlMessage.Error->ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(m.code).array()+stringField(m.message,1024)
         }
         require(out.size<=MAX_CONTROL_PAYLOAD)
@@ -87,6 +91,7 @@ object ControlMessageCodec {
                     val indices=List(count){b.short.toInt() and 65535}
                     ControlMessage.FragmentNack(fid,indices)
                 }
+                ControlType.HEALTH_FEEDBACK->{exact(payload,16);ControlMessage.HealthFeedback(b.int,b.int,b.int,b.int)}
                 ControlType.ERROR->{if(payload.size<6)throw ProtocolException("Invalid ERROR");val code=b.int;val rest=ByteArray(b.remaining()).also(b::get);ControlMessage.Error(code,readStringField(rest,1024))}
             }
         } catch(e:ProtocolException){throw e}catch(e:Exception){throw ProtocolException("Malformed $type payload",e)}
