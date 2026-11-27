@@ -16,13 +16,13 @@ object UdpBurstPacer {
         return if (fragmentCount > 30) Plan(12, 350L) else Plan(maxOf(1, fragmentCount), 0L)
     }
 
-    /** Smooth low-burst pacing for production TX so multi-packet frames do not saturate Wi-Fi AP queues. */
+    /** Smooth low-burst pacing for production TX without multi-ms sleep stalls on Android hrtimer. */
     fun smoothPlan(fragmentCount: Int): Plan {
         require(fragmentCount >= 0)
         return when {
-            fragmentCount <= 10 -> Plan(maxOf(1, fragmentCount), 0L)
-            fragmentCount <= 35 -> Plan(10, 80L)
-            else -> Plan(10, 120L)
+            fragmentCount <= 16 -> Plan(maxOf(1, fragmentCount), 0L)
+            fragmentCount <= 45 -> Plan(12, 30L)
+            else -> Plan(12, 50L)
         }
     }
     fun shouldRequestRecovery(droppedFragments: Int) = droppedFragments > 0

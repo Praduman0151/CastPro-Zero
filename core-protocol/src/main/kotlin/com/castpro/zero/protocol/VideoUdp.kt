@@ -49,12 +49,14 @@ data class VideoFragment(
             fragmentIndex: Int,
             fragmentCount: Int,
             captureTimestampNs: Long,
-            videoKey: ByteArray? = null
+            videoKey: ByteArray? = null,
+            version: Int = 1
         ): ByteArray {
-            val encrypted = videoKey != null
+            val encrypted = videoKey != null && version == 1
             val maxPlain = if (encrypted) MAX_SEALED_VIDEO_PLAINTEXT_BYTES else MAX_VIDEO_PAYLOAD_BYTES
             require(
-                flags in 0..255 &&
+                (version == 1 || version == 2) &&
+                    flags in 0..255 &&
                     frameId in 0..0xffff_ffffL &&
                     fragmentCount in 1..65535 &&
                     fragmentIndex in 0 until fragmentCount &&
@@ -65,7 +67,7 @@ data class VideoFragment(
             val wireLen = if (encrypted) payloadLength + PacketSeal.TAG_BYTES else payloadLength
             val out = ByteArray(VIDEO_HEADER_BYTES + wireLen)
             val b = ByteBuffer.wrap(out).order(ByteOrder.BIG_ENDIAN)
-            b.put(VIDEO_MAGIC).put(1.toByte()).put(flags.toByte()).putLong(sessionId).putInt(frameId.toInt())
+            b.put(VIDEO_MAGIC).put(version.toByte()).put(flags.toByte()).putLong(sessionId).putInt(frameId.toInt())
                 .putShort(fragmentIndex.toShort()).putShort(fragmentCount.toShort()).putShort(wireLen.toShort()).putShort(0)
                 .putLong(captureTimestampNs)
             if (encrypted) {
@@ -89,6 +91,7 @@ data class VideoFragment(
         }
 
         internal data class ParsedHeader(
+            val version: Int,
             val flags: Int,
             val sessionId: Long,
             val frameId: Long,
@@ -105,7 +108,7 @@ data class VideoFragment(
             val b = ByteBuffer.wrap(packet, 0, packetLength).order(ByteOrder.BIG_ENDIAN)
             if (b.get() != VIDEO_MAGIC[0] || b.get() != VIDEO_MAGIC[1]) throw ProtocolException("Invalid CZ magic")
             val version = b.get().toInt() and 255
-            if (version != 1) throw ProtocolException("Unsupported video version")
+            if (version != 1 && version != 2) throw ProtocolException("Unsupported video version")
             val flags = b.get().toInt() and 255
             val session = b.long
             val frame = b.int.toLong() and 0xffff_ffffL
@@ -117,7 +120,7 @@ data class VideoFragment(
             if (count == 0 || index >= count || length != b.remaining()) {
                 throw ProtocolException("Invalid fragment metadata")
             }
-            return ParsedHeader(flags, session, frame, index, count, length, timestamp)
+            return ParsedHeader(version, flags, session, frame, index, count, length, timestamp)
         }
     }
 }
@@ -133,16 +136,30 @@ object VideoFragmenter {
         videoKey: ByteArray? = null
     ): List<ByteArray> {
         require(length > 0 && length <= frame.size)
-        val chunkMax = if (videoKey != null) MAX_SEALED_VIDEO_PLAINTEXT_BYTES else MAX_VIDEO_PAYLOAD_BYTES
-        val count = (length + chunkMax - 1) / chunkMax
+        if (videoKey == null) {
+            val count = (length + MAX_VIDEO_PAYLOAD_BYTES - 1) / MAX_VIDEO_PAYLOAD_BYTES
+            require(count <= 4096)
+            return List(count) { i ->
+                val from = i * MAX_VIDEO_PAYLOAD_BYTES
+                val partLen = minOf(length - from, MAX_VIDEO_PAYLOAD_BYTES)
+                var f = flags
+                if (i == 0) f = f or 1
+                if (i == count - 1) f = f or 2
+                VideoFragment.encodeRange(frame, from, partLen, f, sessionId, frameId, i, count, timestampNs, null, 1)
+            }
+        }
+        // Per-frame AEAD (v2): 1 ChaCha20-Poly1305 seal per frame instead of 32-80 per-fragment calls.
+        val aad = PacketSeal.videoFrameAad(sessionId, frameId, flags and 0xFC, timestampNs)
+        val sealedFrame = PacketSeal.seal(videoKey, PacketSeal.videoFrameNonce(frameId), aad, frame, length)
+        val count = (sealedFrame.size + MAX_VIDEO_PAYLOAD_BYTES - 1) / MAX_VIDEO_PAYLOAD_BYTES
         require(count <= 4096)
         return List(count) { i ->
-            val from = i * chunkMax
-            val partLen = minOf(length - from, chunkMax)
+            val from = i * MAX_VIDEO_PAYLOAD_BYTES
+            val partLen = minOf(sealedFrame.size - from, MAX_VIDEO_PAYLOAD_BYTES)
             var f = flags
             if (i == 0) f = f or 1
             if (i == count - 1) f = f or 2
-            VideoFragment.encodeRange(frame, from, partLen, f, sessionId, frameId, i, count, timestampNs, videoKey)
+            VideoFragment.encodeRange(sealedFrame, from, partLen, f, sessionId, frameId, i, count, timestampNs, null, 2)
         }
     }
 }
@@ -164,6 +181,7 @@ class VideoReassembler(
     private val videoKey: ByteArray? = null
 ) {
     private data class Pending(
+        val version: Int,
         val created: Long,
         val count: Int,
         val flags: Int,
@@ -196,7 +214,7 @@ class VideoReassembler(
         if (existing != null && h.fragmentIndex < existing.parts.size && existing.parts[h.fragmentIndex] != null) {
             return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount)
         }
-        val plaintextPart = if (videoKey != null) {
+        val plaintextPart = if (h.version == 1 && videoKey != null) {
             try {
                 PacketSeal.open(
                     videoKey,
@@ -211,6 +229,8 @@ class VideoReassembler(
             } catch (_: Exception) {
                 return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount + 1, rejected = true)
             }
+        } else if (h.version == 2 && videoKey == null) {
+            return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount + 1, rejected = true)
         } else {
             null
         }
@@ -222,9 +242,9 @@ class VideoReassembler(
             if (shouldPli(nowNs)) needPli = true
         }
         val p = pending.getOrPut(h.frameId) {
-            Pending(nowNs, h.fragmentCount, h.flags, h.captureTimestampNs, arrayOfNulls(h.fragmentCount))
+            Pending(h.version, nowNs, h.fragmentCount, h.flags, h.captureTimestampNs, arrayOfNulls(h.fragmentCount))
         }
-        if (p.count != h.fragmentCount || p.timestamp != h.captureTimestampNs) {
+        if (p.version != h.version || p.count != h.fragmentCount || p.timestamp != h.captureTimestampNs) {
             pending.remove(h.frameId)
             return ReassemblyOutcome(requestPli = shouldPli(nowNs) || needPli, dropped = dropped + 1, rejected = true)
         }
@@ -250,8 +270,19 @@ class VideoReassembler(
             offset += bytes.size
         }
         pending.remove(h.frameId)
+        val plainBytes = if (p.version == 2) {
+            val key = videoKey ?: return ReassemblyOutcome(requestPli = shouldPli(nowNs) || needPli, dropped = dropped + 1, rejected = true)
+            val aad = PacketSeal.videoFrameAad(sessionId, h.frameId, p.flags and 0xFC, p.timestamp)
+            try {
+                PacketSeal.open(key, PacketSeal.videoFrameNonce(h.frameId), aad, result, result.size)
+            } catch (_: Exception) {
+                return ReassemblyOutcome(requestPli = shouldPli(nowNs) || needPli, dropped = dropped + 1, rejected = true)
+            }
+        } else {
+            result
+        }
         newestCompleted = h.frameId
-        return ReassemblyOutcome(listOf(ReassembledFrame(h.frameId, p.flags, result, p.timestamp)), needPli, dropped)
+        return ReassemblyOutcome(listOf(ReassembledFrame(h.frameId, p.flags, plainBytes, p.timestamp)), needPli, dropped)
     }
 
     /** Identifies incomplete multi-fragment frames missing <= maxMissing fragments past nackDelayNs. */

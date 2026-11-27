@@ -96,7 +96,7 @@ class PhoneSenderTransport(
 
             video = DatagramSocket(null).apply {
                 if (binding != null) binding.bindUdp(this) else bind(InetSocketAddress(0))
-                sendBufferSize = 2 * 1024 * 1024
+                sendBufferSize = 256 * 1024
                 try { trafficClass = 0x88 } catch (_: Exception) {}
             }
             audioSocket = DatagramSocket(null).apply {

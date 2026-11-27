@@ -113,6 +113,20 @@ object PacketSeal {
             .putShort(fragmentCount.toShort())
             .array()
 
+    fun videoFrameNonce(frameId: Long): ByteArray =
+        ByteBuffer.allocate(NONCE_BYTES).order(ByteOrder.BIG_ENDIAN)
+            .putInt(0x0400_0000)
+            .putLong(frameId)
+            .array()
+
+    fun videoFrameAad(sessionId: Long, frameId: Long, frameFlags: Int, captureTimestampNs: Long): ByteArray =
+        ByteBuffer.allocate(24).order(ByteOrder.BIG_ENDIAN)
+            .putLong(sessionId)
+            .putInt(frameId.toInt())
+            .putInt(frameFlags)
+            .putLong(captureTimestampNs)
+            .array()
+
     fun audioNonce(sequence: Long): ByteArray =
         ByteBuffer.allocate(NONCE_BYTES).order(ByteOrder.BIG_ENDIAN)
             .putInt(0x0200_0000)

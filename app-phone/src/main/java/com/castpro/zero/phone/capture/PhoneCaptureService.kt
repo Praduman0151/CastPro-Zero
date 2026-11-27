@@ -25,6 +25,7 @@ import android.os.PowerManager
 import android.os.Process
 import android.util.Log
 import android.view.Surface
+import android.view.WindowManager
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.castpro.zero.phone.PhoneSessionBus
@@ -76,6 +77,10 @@ class PhoneCaptureService : Service() {
     private var firstFrameLogged = false
     @Volatile private var activeWidth = WIDTH
     @Volatile private var activeHeight = HEIGHT
+    @Volatile private var sourceDisplayWidth = WIDTH
+    @Volatile private var sourceDisplayHeight = HEIGHT
+    @Volatile private var maxLongSide = WIDTH
+    @Volatile private var activeBitrateBps = BitrateOptions.toBps(BitrateOptions.DEFAULT_MBPS)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -147,17 +152,32 @@ class PhoneCaptureService : Service() {
                     override fun onStop() = stopCaptureAsync()
                     override fun onCapturedContentResize(width: Int, height: Int) {
                         if (width > 1 && height > 1) {
-                            display?.let { virtualDisplay ->
-                                virtualDisplay.resize(width, height, resources.displayMetrics.densityDpi)
-                                virtualDisplay.setSurface(surface)
+                            sourceDisplayWidth = width
+                            sourceDisplayHeight = height
+                            val (newW, newH) = computeAspectFitSize(width, height, maxLongSide)
+                            if (kotlin.math.abs(newW - activeWidth) > 16 || kotlin.math.abs(newH - activeHeight) > 16) {
+                                startup.execute {
+                                    reconfigureResolution(newW, newH, activeBitrateBps)
+                                }
                             }
                         }
                     }
                 }, Handler(mainLooper))
                 abrController = AdaptiveBitrateController(requestedBitrate)
+                activeBitrateBps = requestedBitrate
+                maxLongSide = WIDTH
+                val bounds = try {
+                    getSystemService(WindowManager::class.java)?.currentWindowMetrics?.bounds
+                } catch (_: Exception) {
+                    null
+                }
+                val dm = resources.displayMetrics
+                sourceDisplayWidth = (bounds?.width() ?: dm.widthPixels).coerceAtLeast(2)
+                sourceDisplayHeight = (bounds?.height() ?: dm.heightPixels).coerceAtLeast(2)
+                val (initW, initH) = computeAspectFitSize(sourceDisplayWidth, sourceDisplayHeight, maxLongSide)
                 lastTxCongestionCount = 0L
                 registerThermalListener()
-                startEncoder(requestedBitrate)
+                startEncoder(requestedBitrate, initW, initH)
                 if (stopping.get()) { teardown(); return@execute }
                 val current = sender
                 val currentProjection = projection
@@ -224,7 +244,7 @@ class PhoneCaptureService : Service() {
         sender?.sendStreamConfig(
             ControlMessage.StreamConfig(1, aligned.width, aligned.height, FPS, bitrate, 1, 3, 2)
         )
-        val queue = BoundedFrameQueue(capacity = 4, pool = framePool)
+        val queue = BoundedFrameQueue(capacity = 2, pool = framePool)
         frameQueue = queue
         frameLogCount = 0
         firstFrameLogged = false
@@ -278,8 +298,11 @@ class PhoneCaptureService : Service() {
                 thermalLevel = thermalLevel
             )
         )
+        activeBitrateBps = decision.targetBitrateBps
         if (decision.resolutionChanged) {
-            startup.execute { reconfigureResolution(decision.targetProfile, decision.targetBitrateBps) }
+            maxLongSide = maxOf(decision.targetProfile.width, decision.targetProfile.height)
+            val (targetW, targetH) = computeAspectFitSize(sourceDisplayWidth, sourceDisplayHeight, maxLongSide)
+            startup.execute { reconfigureResolution(targetW, targetH, decision.targetBitrateBps) }
         } else if (decision.bitrateChanged) {
             try {
                 codec?.setParameters(Bundle().apply {
@@ -292,7 +315,7 @@ class PhoneCaptureService : Service() {
         }
     }
 
-    private fun reconfigureResolution(profile: ResolutionProfile, bitrate: Int) = synchronized(codecLock) {
+    private fun reconfigureResolution(targetWidth: Int, targetHeight: Int, bitrate: Int) = synchronized(codecLock) {
         if (stopping.get() || projection == null) return@synchronized
         reconfiguring.set(true)
         try {
@@ -308,8 +331,8 @@ class PhoneCaptureService : Service() {
             codec = null
             try { surface?.release() } catch (_: Exception) {}
             surface = null
-            startEncoder(bitrate, profile.width, profile.height)
-            Log.i(TAG, "ABR switched resolution to ${profile.width}x${profile.height} @ ${bitrate / 1_000_000.0} Mbps")
+            startEncoder(bitrate, targetWidth, targetHeight)
+            Log.i(TAG, "ABR/resize switched resolution to ${targetWidth}x${targetHeight} @ ${bitrate / 1_000_000.0} Mbps")
         } catch (e: Exception) {
             Log.e(TAG, "Resolution reconfiguration failed", e)
             stopCaptureAsync()
@@ -333,7 +356,8 @@ class PhoneCaptureService : Service() {
                     if (output != null && info.size > 0) {
                         size = info.size
                         flags = info.flags
-                        ptsNs = info.presentationTimeUs * 1_000L
+                        // Use System.nanoTime() so video and AudioCapture share one monotonic clock.
+                        ptsNs = System.nanoTime().coerceAtLeast(0L)
                         val buf = framePool.acquire(size)
                         borrowed = buf
                         val view = output.duplicate()
@@ -405,6 +429,10 @@ class PhoneCaptureService : Service() {
         while (active.get()) {
             val frame = queue.poll(100) ?: continue
             try {
+                if (!frame.keyframe && System.nanoTime() - frame.captureTimestampNs > MAX_TX_FRAME_AGE_NS) {
+                    requestEncoderSyncFrame(enc)
+                    continue
+                }
                 if (!firstFrameLogged) {
                     firstFrameLogged = true
                     Log.i(TAG, "First transmitted frame wall-clock=${System.nanoTime()} ns, codec=${enc.name}")
@@ -539,7 +567,18 @@ class PhoneCaptureService : Service() {
         )
     }
 
+    private fun computeAspectFitSize(sourceW: Int, sourceH: Int, maxLong: Int): Pair<Int, Int> {
+        val w = sourceW.coerceAtLeast(2)
+        val h = sourceH.coerceAtLeast(2)
+        val longSide = maxOf(w, h)
+        val scale = if (longSide > maxLong) maxLong.toDouble() / longSide.toDouble() else 1.0
+        val outW = (((w * scale).toInt() + 1) and 1.inv()).coerceAtLeast(2)
+        val outH = (((h * scale).toInt() + 1) and 1.inv()).coerceAtLeast(2)
+        return outW to outH
+    }
+
     companion object {
+        private const val MAX_TX_FRAME_AGE_NS = 80_000_000L
         const val ACTION_STOP = "com.castpro.zero.phone.action.STOP"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"

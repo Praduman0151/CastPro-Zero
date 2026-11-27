@@ -105,7 +105,7 @@ data class QueueEnqueueResult(
  * sync-frame is requested so the TV decoder never receives a broken P-frame dependency chain.
  */
 class BoundedFrameQueue(
-    private val capacity: Int = 4,
+    private val capacity: Int = 2,
     private val pool: FrameBufferPool
 ) {
     private val lock = ReentrantLock()

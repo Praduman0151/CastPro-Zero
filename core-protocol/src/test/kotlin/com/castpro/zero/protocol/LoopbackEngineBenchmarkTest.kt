@@ -55,7 +55,7 @@ class LoopbackEngineBenchmarkTest {
                     peer.soTimeout = 10_000
                     val auth = SessionHandshake.serverWithKeys(peer, token, allowLoopbackForTests = true)
                     // Pre-initialize JCE ChaCha20-Poly1305 Cipher on RX thread before timed video arrives.
-                    val warmFrag = VideoFragmenter.fragment(ByteArray(16), auth.sessionId, 0L, 0, 0L, videoKey = auth.keys.videoKey)
+                    val warmFrag = VideoFragmenter.fragment(ByteArray(16), auth.sessionId, 0x7fff_ffffL, 0, 0L, videoKey = auth.keys.videoKey)
                     VideoReassembler(auth.sessionId, PRODUCTION_FRAME_DEADLINE_NS, videoKey = auth.keys.videoKey).accept(warmFrag[0], 0L)
                     authResultRef.set(auth)
                     handshakeDone.countDown()
@@ -103,7 +103,7 @@ class LoopbackEngineBenchmarkTest {
             val handshakeMs = (System.nanoTime() - handshakeStartNs) / 1_000_000.0
             val sAuth = authResultRef.get()!!
             assertEquals(res.sessionId, sAuth.sessionId)
-            val txWarm = VideoFragmenter.fragment(ByteArray(16), res.sessionId, 0L, 0, 0L, videoKey = res.keys.videoKey)
+            val txWarm = VideoFragmenter.fragment(ByteArray(16), res.sessionId, 0x7fff_ffffL, 0, 0L, videoKey = res.keys.videoKey)
             assertTrue(txWarm.isNotEmpty())
 
             val audioReader = Thread {

@@ -161,7 +161,7 @@ class TvCastServer(
                 val video = DatagramSocket(null).apply {
                     reuseAddress = true
                     bind(InetSocketAddress(lan.address, UDP_PORT))
-                    receiveBufferSize = 4 * 1024 * 1024
+                    receiveBufferSize = 512 * 1024
                     soTimeout = 5
                     try { trafficClass = 0x88 } catch (_: Exception) {}
                 }
@@ -486,7 +486,7 @@ class TvCastServer(
                 .setSampleRate(config.sampleRateHz)
                 .setChannelMask(channelMask)
                 .build()
-            val targetBufferBytes = maxOf(min, 4 * 3840) // ~80ms ceiling or hardware min
+            val targetBufferBytes = maxOf(min, 2 * 3840) // ~40ms ceiling or hardware min
             val builder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -572,7 +572,10 @@ class TvCastServer(
                 AvSyncAction.DROP_STALE_AUDIO -> {
                     if (buf.queuedFrames() > 1 && buf.dropHead()) continue
                 }
-                AvSyncAction.HOLD_AUDIO -> return
+                AvSyncAction.HOLD_AUDIO -> {
+                    if (senderNowNs - head.frame.timestampNs > 80_000_000L && buf.dropHead()) continue
+                    return
+                }
                 AvSyncAction.PLAY_NORMAL -> Unit
             }
             val written = try {
@@ -655,7 +658,7 @@ class TvCastServer(
             pendingCsdForDecoder = csd?.copyOf() ?: data.copyOf()
             decoder = codecToStart
             decoderName = codecToStart.name
-            videoQueue = TvVideoFrameQueue(capacity = 6)
+            videoQueue = TvVideoFrameQueue(capacity = 3)
             Log.i(TAG, "Active decoder: $decoderName at ${cfg.width}x${cfg.height}@${cfg.fps}")
             Thread({ feedDecoder(codecToStart, videoQueue) }, "CPZ-TV-decoder-feed").start()
             Thread({ drainOutput(codecToStart) }, "CPZ-TV-output-drain").start()
@@ -688,6 +691,9 @@ class TvCastServer(
                 codec.configure(base, target, null, 0)
             }
         }
+        try {
+            codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+        } catch (_: Exception) {}
     }
 
     /** Single owner of MediaCodec input buffers (both CSD and video access units). */
@@ -876,11 +882,12 @@ class TvCastServer(
                             "RX frameId=${frame.frameId} fragCount=${(frame.bytes.size + MAX_VIDEO_PAYLOAD_BYTES - 1) / MAX_VIDEO_PAYLOAD_BYTES} size=${frame.bytes.size} keyframe=$keyframe NAL=$nalTypes"
                         )
                     }
-                    val offered = videoQueue.offer(frame)
+                    val offered = videoQueue.offer(frame, clockOffset.toSenderTimeNs(nowNs), 120_000_000L)
                     if (offered.discontinuityRequired) {
                         dropped.incrementAndGet()
                         health.onDecoderBackpressure()
                         gate.resetForDiscontinuity()
+                        requestPliAsync(3)
                     }
                 }
             } catch (_: SocketTimeoutException) {
