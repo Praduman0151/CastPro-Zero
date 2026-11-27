@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
+import android.os.Process
 import android.util.Log
 import com.castpro.zero.phone.net.PhoneSenderTransport
 import com.castpro.zero.protocol.AudioFrame
@@ -62,6 +63,7 @@ class AudioCapture(
     }
 
     private fun pump(rec: AudioRecord) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Exception) {}
         val buffer = ByteArray(AudioCapturePolicy.CHUNK_BYTES)
         val session = sender.sessionId()
         var sequence = 0L
@@ -91,10 +93,12 @@ class AudioCapture(
     override fun close() {
         running = false
         try { record?.stop() } catch (_: Exception) {}
+        val worker = thread
+        thread = null
+        worker?.interrupt()
+        try { worker?.join(300) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
         try { record?.release() } catch (_: Exception) {}
         record = null
-        thread?.interrupt()
-        thread = null
         onState(false)
     }
 

@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
@@ -20,6 +21,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import androidx.core.app.ServiceCompat
@@ -37,9 +39,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Foreground MediaProjection sender. Every encoded access unit is transmitted;
- * releaseOutputBuffer(false) is the mandatory encoder buffer return after
- * transmission, never a frame discard loop.
+ * Foreground MediaProjection sender. MediaCodec output buffers are copied into pooled
+ * byte arrays and released immediately so blocking/paced UDP transmission never stalls
+ * hardware encoder output slots.
  */
 class PhoneCaptureService : Service() {
     private var projection: MediaProjection? = null
@@ -49,29 +51,47 @@ class PhoneCaptureService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var sender: PhoneSenderTransport? = null
     private var audio: AudioCapture? = null
+    private var frameQueue: BoundedFrameQueue? = null
+    private val framePool = FrameBufferPool(maxPooled = 16)
+    private var drainThread: Thread? = null
+    private var txThread: Thread? = null
+    private var statsThread: Thread? = null
     private val active = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
     private val telemetry = SenderTelemetryState()
     private val startup = OffThreadStartup(
         Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "CPZ-capture-startup") }
     )
+    private val shutdownExecutor =
+        Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "CPZ-capture-stop") }
     private var frameLogCount = 0
     private var firstFrameLogged = false
+    @Volatile private var activeWidth = WIDTH
+    @Volatile private var activeHeight = HEIGHT
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) { stopCapture(); return START_NOT_STICKY }
+        if (intent?.action == ACTION_STOP) {
+            stopCaptureAsync()
+            return START_NOT_STICKY
+        }
+        stopping.set(false)
         ensureNotificationChannel()
         val stopIntent = Intent(this, PhoneCaptureService::class.java).setAction(ACTION_STOP)
         val stopPendingIntent = PendingIntent.getService(
             this, 42, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val stopAction = Notification.Action.Builder(
+            Icon.createWithResource(this, android.R.drawable.ic_media_pause),
+            "Stop casting",
+            stopPendingIntent
+        ).build()
         val notification = Notification.Builder(this, CHANNEL)
             .setContentTitle("CastPro-Zero")
             .setContentText("Screen capture is active")
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .addAction(android.R.drawable.ic_media_pause, "Stop casting", stopPendingIntent)
+            .addAction(stopAction)
             .build()
         // Android 15/16: foreground promotion MUST precede getMediaProjection().
         ServiceCompat.startForeground(
@@ -79,7 +99,7 @@ class PhoneCaptureService : Service() {
         )
 
         val code = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
-        val consent = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        val consent = intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         val host = intent?.getStringExtra(EXTRA_TV_IP)
         val token = intent?.getStringExtra(EXTRA_PAIRING_TOKEN)
         val tcpPort = intent?.getIntExtra(EXTRA_TCP_PORT, DEFAULT_TCP_PORT) ?: DEFAULT_TCP_PORT
@@ -88,74 +108,70 @@ class PhoneCaptureService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        val requestedBitrate = BitrateOptions.toBps(
+            intent.getIntExtra(EXTRA_BITRATE, BitrateOptions.DEFAULT_MBPS)
+        )
         // Network I/O and projection/encoder setup must not run on the main thread.
         startup.execute {
-        if (stopping.get()) return@execute
-        try {
-            val binding = LocalNetworkBinding(this)
-            sender = PhoneSenderTransport(host, tcpPort, udpPort, token,
-                onPli = {
-                    Log.i(TAG, "PLI received; cached CSD replayed and sync frame requested")
-                    sender?.stats()?.pliCount?.let { telemetry.onPli(it) }?.let(PhoneSessionBus::publish)
-                },
-                onRtt = { measured ->
-                    telemetry.onRtt(measured)?.let(PhoneSessionBus::publish)
-                },
-                onSyncFrameRequest = {
-                    try {
-                        codec?.setParameters(Bundle().apply {
-                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                        })
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Sync-frame request failed", e)
-                    }
-                },
-                binding = binding
-            ).also { it.connect() }
-            if (stopping.get()) { teardown(); return@execute }
+            if (stopping.get()) return@execute
+            try {
+                val binding = LocalNetworkBinding(this)
+                sender = PhoneSenderTransport(
+                    host, tcpPort, udpPort, token,
+                    onPli = {
+                        Log.i(TAG, "PLI received; cached CSD replayed and sync frame requested")
+                        sender?.stats()?.pliCount?.let { telemetry.onPli(it) }?.let(PhoneSessionBus::publish)
+                    },
+                    onRtt = { measured ->
+                        telemetry.onRtt(measured)?.let(PhoneSessionBus::publish)
+                    },
+                    onSyncFrameRequest = { requestEncoderSyncFrame(codec) },
+                    binding = binding
+                ).also { it.connect() }
+                if (stopping.get()) { teardown(); return@execute }
 
-            // Fresh one-use consent data is required for every projection session.
-            projection = getSystemService(MediaProjectionManager::class.java)
-                .getMediaProjection(code, consent)
-            // Callback must be registered before createVirtualDisplay().
-            projection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() = stopCapture()
-                override fun onCapturedContentResize(width: Int, height: Int) {
-                    if (width > 1 && height > 1) {
-                        display?.let { virtualDisplay ->
-                            virtualDisplay.resize(width, height, resources.displayMetrics.densityDpi)
-                            virtualDisplay.setSurface(surface)
+                // Fresh one-use consent data is required for every projection session.
+                projection = getSystemService(MediaProjectionManager::class.java)
+                    .getMediaProjection(code, consent)
+                // Callback must be registered before createVirtualDisplay().
+                projection?.registerCallback(object : MediaProjection.Callback() {
+                    override fun onStop() = stopCaptureAsync()
+                    override fun onCapturedContentResize(width: Int, height: Int) {
+                        if (width > 1 && height > 1) {
+                            display?.let { virtualDisplay ->
+                                virtualDisplay.resize(width, height, resources.displayMetrics.densityDpi)
+                                virtualDisplay.setSurface(surface)
+                            }
                         }
                     }
-                }
-            }, Handler(mainLooper))
-            startEncoder(BitrateOptions.toBps(intent.getIntExtra(EXTRA_BITRATE, BitrateOptions.DEFAULT_MBPS)))
-            if (stopping.get()) { teardown(); return@execute }
-            val current = sender
-            val currentProjection = projection
-            if (current != null && currentProjection != null && AudioCapturePolicy.shouldCapture(
-                    ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
-                    true
-                )) {
-                try {
-                    val capture = AudioCapture(currentProjection, current, PhoneSessionBus::publishAudio)
-                    audio = capture
-                    capture.start()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Audio capture unavailable; continuing video cast", e)
-                    try { audio?.close() } catch (_: Exception) {}
-                    audio = null
+                }, Handler(mainLooper))
+                startEncoder(requestedBitrate)
+                if (stopping.get()) { teardown(); return@execute }
+                val current = sender
+                val currentProjection = projection
+                if (current != null && currentProjection != null && AudioCapturePolicy.shouldCapture(
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
+                        true
+                    )) {
+                    try {
+                        val capture = AudioCapture(currentProjection, current, PhoneSessionBus::publishAudio)
+                        audio = capture
+                        capture.start()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Audio capture unavailable; continuing video cast", e)
+                        try { audio?.close() } catch (_: Exception) {}
+                        audio = null
+                        PhoneSessionBus.publishAudio(false)
+                    }
+                } else {
+                    Log.i(TAG, "Audio capture skipped (permission or projection unavailable); video cast continues")
                     PhoneSessionBus.publishAudio(false)
                 }
-            } else {
-                Log.i(TAG, "Audio capture skipped (permission or projection unavailable); video cast continues")
-                PhoneSessionBus.publishAudio(false)
+            } catch (e: Exception) {
+                Log.e(TAG, "Projection startup failed", e)
+                stopping.set(true)
+                teardown()
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Projection startup failed", e)
-            stopping.set(true)
-            teardown()
-        }
         }
         return START_NOT_STICKY
     }
@@ -166,79 +182,89 @@ class PhoneCaptureService : Service() {
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "CPZ-low-latency")
                 .also { it.acquire() }
         }
-        val format = EncoderFormatPolicy.build(WIDTH, HEIGHT, bitrate, FPS, true)
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        EncoderFormatPolicy.configureWithFallback(
-            enc, format, EncoderFormatPolicy.build(WIDTH, HEIGHT, bitrate, FPS, false)
+        val caps = enc.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
+        val aligned = if (caps != null) {
+            EncoderFormatPolicy.alignedDimensions(caps, WIDTH, HEIGHT)
+        } else {
+            EncoderFormatPolicy.Dimensions(WIDTH, HEIGHT)
+        }
+        activeWidth = aligned.width
+        activeHeight = aligned.height
+        val appliedSpec = EncoderFormatPolicy.configureWithFallback(
+            enc, EncoderFormatPolicy.specsFor(aligned.width, aligned.height, bitrate, FPS)
         )
         codec = enc
         surface = enc.createInputSurface()
         enc.start()
-        Log.i(TAG, "Encoder started: ${enc.name} at ${WIDTH}x${HEIGHT}@${FPS}, ${bitrate / 1_000_000} Mbps")
+        Log.i(TAG, "Encoder started: ${enc.name} tier=${appliedSpec.tier} at ${aligned.width}x${aligned.height}@${FPS}, ${bitrate / 1_000_000} Mbps")
         // Exactly one VirtualDisplay is created; resizing goes through resize().
         display = projection?.createVirtualDisplay(
-            "CastPro-Zero", WIDTH, HEIGHT, resources.displayMetrics.densityDpi,
+            "CastPro-Zero", aligned.width, aligned.height, resources.displayMetrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null
         )
         sender?.sendStreamConfig(
-            ControlMessage.StreamConfig(1, WIDTH, HEIGHT, FPS, bitrate, 1, 3, 2)
+            ControlMessage.StreamConfig(1, aligned.width, aligned.height, FPS, bitrate, 1, 3, 2)
         )
+        val queue = BoundedFrameQueue(capacity = 4, pool = framePool)
+        frameQueue = queue
+        frameLogCount = 0
+        firstFrameLogged = false
         active.set(true)
         PhoneSessionBus.publishStreaming(true)
-        Thread({ drain(enc) }, "CPZ-encoder-drain").start()
-        Thread({ statsLoop(enc) }, "CPZ-phone-stats").start()
+        txThread = Thread({ txLoop(enc, queue) }, "CPZ-video-tx").also { it.start() }
+        drainThread = Thread({ drain(enc, queue) }, "CPZ-encoder-drain").also { it.start() }
+        statsThread = Thread({ statsLoop(enc) }, "CPZ-phone-stats").also { it.start() }
     }
 
-    private fun drain(enc: MediaCodec) {
+    private fun drain(enc: MediaCodec, queue: BoundedFrameQueue) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
         val info = MediaCodec.BufferInfo()
         while (active.get()) {
             val index = try { enc.dequeueOutputBuffer(info, 10_000) } catch (_: Exception) { break }
             if (index >= 0) {
+                var borrowed: ByteArray? = null
+                var size = 0
+                var flags = 0
+                var ptsNs = 0L
                 try {
                     val output = enc.getOutputBuffer(index)
                     if (output != null && info.size > 0) {
-                        val data = ByteArray(info.size)
+                        size = info.size
+                        flags = info.flags
+                        ptsNs = info.presentationTimeUs * 1_000L
+                        val buf = framePool.acquire(size)
+                        borrowed = buf
                         val view = output.duplicate()
                         view.position(info.offset)
-                        view.limit(info.offset + info.size)
-                        view.get(data)
-                        val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                        val isKeyframe = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                        if (isConfig) {
-                            val sets = AnnexB.extract(data, VideoCodec.AVC)
-                            if (sets != null) sender?.sendCsd(1, sets.annexB())
-                            else Log.w(TAG, "CODEC_CONFIG had no valid Annex-B parameter sets")
-                        } else {
-                            if (!firstFrameLogged) {
-                                firstFrameLogged = true
-                                Log.i(TAG, "First transmitted frame wall-clock=${System.nanoTime()} ns, codec=${enc.name}")
-                            }
-                            // Every encoded access unit is sent; no drop path exists.
-                            when (val outcome = sender?.sendVideoFrame(data, isKeyframe, info.presentationTimeUs * 1_000L)
-                                ?: SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)) {
-                                is SendOutcome.Sent -> {
-                                    if (frameLogCount < 10) {
-                                        frameLogCount++
-                                        val nalTypes = AnnexB.nalUnits(data).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
-                                        Log.i(TAG, "TX frameId=${outcome.frameId} fragCount=${outcome.fragmentCount} size=${outcome.byteCount} keyframe=$isKeyframe NAL=$nalTypes")
-                                    }
-                                }
-                                is SendOutcome.NotSent -> {
-                                    val message = SendFailurePolicy.message(outcome.failure)
-                                    if (SendFailurePolicy.isExpected(outcome.failure)) Log.w(TAG, message)
-                                    else Log.e(TAG, message, outcome.cause)
-                                    PhoneSessionBus.publishStatus(message)
-                                    active.set(false)
-                                }
-                            }
+                        view.limit(info.offset + size)
+                        view.get(buf, 0, size)
+                    }
+                } finally {
+                    // Immediately return MediaCodec output buffer before CSD/network work.
+                    try { enc.releaseOutputBuffer(index, false) } catch (_: Exception) {}
+                }
+                val buf = borrowed ?: continue
+                try {
+                    val isConfig = (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    val isKeyframe = (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                    val classified = EncoderOutputPolicy.classify(buf, size, isConfig, isKeyframe, VideoCodec.AVC)
+                    classified.csdAnnexB?.let { sender?.sendCsd(1, it) }
+                    if (isConfig && classified.csdAnnexB == null) {
+                        Log.w(TAG, "CODEC_CONFIG had no valid Annex-B parameter sets")
+                    }
+                    if (classified.emitVideoFrame && classified.videoBytes != null) {
+                        val enqueueResult = queue.enqueue(buf, size, classified.keyframe, ptsNs)
+                        if (enqueueResult.backlogClearedForSync) {
+                            requestEncoderSyncFrame(enc)
                         }
+                    } else {
+                        framePool.release(buf)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Authenticated LAN frame transmission failed", e)
+                    framePool.release(buf)
+                    Log.e(TAG, "Encoder output processing failed", e)
                     active.set(false)
-                } finally {
-                    // Mandatory encoder buffer return after the transmit attempt.
-                    enc.releaseOutputBuffer(index, false)
                 }
             } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 try {
@@ -248,18 +274,77 @@ class PhoneCaptureService : Service() {
                         ?.let { ByteArray(it.remaining()).also(it::get) }
                     val csd1 = format.getByteBuffer("csd-1")?.duplicate()
                         ?.let { ByteArray(it.remaining()).also(it::get) }
-                    val annexB = listOfNotNull(csd0, csd1).fold(ByteArray(0)) { acc, nal ->
-                        acc + byteArrayOf(0, 0, 0, 1) + nal
+                    val csd2 = format.getByteBuffer("csd-2")?.duplicate()
+                        ?.let { ByteArray(it.remaining()).also(it::get) }
+                    val totalSize = listOfNotNull(csd0, csd1, csd2).sumOf { 4 + it.size }
+                    if (totalSize > 0) {
+                        val annexB = ByteArray(totalSize)
+                        var offset = 0
+                        listOfNotNull(csd0, csd1, csd2).forEach { nal ->
+                            annexB[offset] = 0; annexB[offset + 1] = 0
+                            annexB[offset + 2] = 0; annexB[offset + 3] = 1
+                            offset += 4
+                            nal.copyInto(annexB, offset)
+                            offset += nal.size
+                        }
+                        val sets = AnnexB.extract(annexB, VideoCodec.AVC)
+                        if (sets != null) sender?.sendCsd(1, sets.annexB())
                     }
-                    val sets = AnnexB.extract(annexB, VideoCodec.AVC)
-                    if (sets != null) sender?.sendCsd(1, sets.annexB())
                 } catch (e: Exception) {
                     Log.e(TAG, "Encoder format/CSD delivery failed", e)
                     active.set(false)
                 }
             }
         }
-        if (!stopping.get()) Handler(mainLooper).post { stopCapture() }
+        if (!stopping.get()) stopCaptureAsync()
+    }
+
+    private fun txLoop(enc: MediaCodec, queue: BoundedFrameQueue) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
+        while (active.get()) {
+            val frame = queue.poll(100) ?: continue
+            try {
+                if (!firstFrameLogged) {
+                    firstFrameLogged = true
+                    Log.i(TAG, "First transmitted frame wall-clock=${System.nanoTime()} ns, codec=${enc.name}")
+                }
+                when (val outcome = sender?.sendVideoFrame(
+                    frame.buffer, frame.keyframe, frame.captureTimestampNs, frame.length
+                ) ?: SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)) {
+                    is SendOutcome.Sent -> {
+                        if (frameLogCount < 10) {
+                            frameLogCount++
+                            val nalTypes = AnnexB.nalUnits(frame.buffer.copyOf(frame.length))
+                                .mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
+                            Log.i(TAG, "TX frameId=${outcome.frameId} fragCount=${outcome.fragmentCount} size=${outcome.byteCount} keyframe=${frame.keyframe} NAL=$nalTypes")
+                        }
+                    }
+                    is SendOutcome.NotSent -> {
+                        val message = SendFailurePolicy.message(outcome.failure)
+                        if (SendFailurePolicy.isExpected(outcome.failure)) Log.w(TAG, message)
+                        else Log.e(TAG, message, outcome.cause)
+                        PhoneSessionBus.publishStatus(message)
+                        active.set(false)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Authenticated LAN frame transmission failed", e)
+                active.set(false)
+            } finally {
+                framePool.release(frame.buffer)
+            }
+        }
+        if (!stopping.get()) stopCaptureAsync()
+    }
+
+    private fun requestEncoderSyncFrame(enc: MediaCodec?) {
+        try {
+            enc?.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            })
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync-frame request failed", e)
+        }
     }
 
     private fun statsLoop(enc: MediaCodec) {
@@ -278,9 +363,16 @@ class PhoneCaptureService : Service() {
             lastFrames = snapshot.framesSent
             lastBytes = snapshot.bytesSent
             PhoneSessionBus.publish(telemetry.publishMeasured(transport.stats(fps, mbps, enc.name).copy(
-                resolution = "${WIDTH}×${HEIGHT}", audioActive = audio?.isActive() == true
+                resolution = "${activeWidth}×${activeHeight}", audioActive = audio?.isActive() == true
             )))
         }
+    }
+
+    private fun stopCaptureAsync() {
+        if (!stopping.compareAndSet(false, true)) return
+        startup.cancel()
+        telemetry.reset()
+        shutdownExecutor.execute { teardown() }
     }
 
     private fun stopCapture() {
@@ -290,9 +382,18 @@ class PhoneCaptureService : Service() {
         teardown()
     }
 
-    /** Idempotent resource release; safe to call again from a racing startup block. */
+    /** Idempotent resource release; safe to call off the main thread. */
+    @Synchronized
     private fun teardown() {
         active.set(false)
+        frameQueue?.close()
+        frameQueue = null
+        listOf(drainThread, txThread, statsThread).forEach { thread ->
+            thread?.interrupt()
+            try { thread?.join(400) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+        }
+        drainThread = null; txThread = null; statsThread = null
+        framePool.clear()
         try { display?.release() } catch (_: Exception) {}
         display = null
         try { codec?.stop(); codec?.release() } catch (_: Exception) {}
@@ -314,18 +415,16 @@ class PhoneCaptureService : Service() {
         stopSelf()
     }
 
-
     override fun onDestroy() {
         stopCapture()
+        shutdownExecutor.shutdownNow()
         super.onDestroy()
     }
 
     private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL, "Screen casting", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL, "Screen casting", NotificationManager.IMPORTANCE_LOW)
+        )
     }
 
     companion object {

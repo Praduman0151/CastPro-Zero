@@ -109,7 +109,7 @@ class PhoneSenderTransport(
 
     fun sendRttReport(rttMs: Long) = sendControl(ControlMessage.RttReport(rttMs))
 
-    @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime()): SendOutcome {
+    @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime(), length: Int = bytes.size): SendOutcome {
         // A closed transport and an unreachable LAN are ordinary teardown events.
         // Reporting them through exceptions produced misleading "Pairing is required"
         // stack traces on Wi-Fi loss, so they are returned as outcomes instead.
@@ -118,7 +118,7 @@ class PhoneSenderTransport(
         if (!running.get()) return SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
         val currentFrameId = frameId++
         val fragments = VideoFragmenter.fragment(bytes, sessionId, currentFrameId,
-            if (keyframe) 4 else 0, timestampNs)
+            if (keyframe) 4 else 0, timestampNs, length)
         val pacing = UdpBurstPacer.plan(fragments.size)
         fragments.forEachIndexed { index, data ->
             check(data.size <= MAX_UDP_DATAGRAM_BYTES)
@@ -132,7 +132,7 @@ class PhoneSenderTransport(
                 LockSupport.parkNanos(pacing.pauseMicros * 1_000L)
         }
         framesSent.incrementAndGet()
-        return SendOutcome.Sent(currentFrameId, fragments.size, bytes.size)
+        return SendOutcome.Sent(currentFrameId, fragments.size, length)
     }
 
     /** Device audio travels on its own authenticated datagram channel, derived from the video port. */

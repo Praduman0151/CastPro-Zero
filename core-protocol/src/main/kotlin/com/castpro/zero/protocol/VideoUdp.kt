@@ -36,9 +36,9 @@ data class VideoFragment(val flags:Int,val sessionId:Long,val frameId:Long,val f
     }
 }
 object VideoFragmenter {
-    fun fragment(frame:ByteArray,sessionId:Long,frameId:Long,flags:Int,timestampNs:Long):List<ByteArray>{
-        require(frame.isNotEmpty());val count=(frame.size+MAX_VIDEO_PAYLOAD_BYTES-1)/MAX_VIDEO_PAYLOAD_BYTES;require(count<=4096)
-        return (0 until count).map{i->val from=i*MAX_VIDEO_PAYLOAD_BYTES;val to=minOf(frame.size,from+MAX_VIDEO_PAYLOAD_BYTES);var f=flags;if(i==0)f=f or 1;if(i==count-1)f=f or 2;VideoFragment(f,sessionId,frameId,i,count,frame.copyOfRange(from,to),timestampNs).encode()}
+    fun fragment(frame:ByteArray,sessionId:Long,frameId:Long,flags:Int,timestampNs:Long,length:Int=frame.size):List<ByteArray>{
+        require(length>0 && length<=frame.size);val count=(length+MAX_VIDEO_PAYLOAD_BYTES-1)/MAX_VIDEO_PAYLOAD_BYTES;require(count<=4096)
+        return (0 until count).map{i->val from=i*MAX_VIDEO_PAYLOAD_BYTES;val to=minOf(length,from+MAX_VIDEO_PAYLOAD_BYTES);var f=flags;if(i==0)f=f or 1;if(i==count-1)f=f or 2;VideoFragment(f,sessionId,frameId,i,count,frame.copyOfRange(from,to),timestampNs).encode()}
     }
 }
 data class ReassembledFrame(val frameId:Long,val flags:Int,val bytes:ByteArray,val captureTimestampNs:Long)
