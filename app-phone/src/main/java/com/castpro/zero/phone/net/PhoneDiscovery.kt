@@ -4,19 +4,22 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.util.Log
 import com.castpro.zero.protocol.Discovery
-import com.castpro.zero.protocol.LocalAddressPolicy
+import com.castpro.zero.protocol.LanDiscoveryBeacon
 import com.castpro.zero.protocol.ProtocolException
-import com.castpro.zero.protocol.TvPairingPayload
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** LAN-only discovery receiver. Uses the same CPZ0 payload as the TV's offline QR code. */
+/**
+ * LAN-only discovery receiver. Receives endpoint identity beacons (IP + ports) and validates
+ * that the packet source address matches the advertised IPv4 address. Never accepts or extracts
+ * pairing tokens from unauthenticated broadcasts.
+ */
 class PhoneDiscovery(
     context: Context,
     private val binding: LocalNetworkBinding,
-    private val onDevice: (TvPairingPayload) -> Unit
+    private val onDevice: (LanDiscoveryBeacon) -> Unit
 ) : AutoCloseable {
     private val running = AtomicBoolean(true)
     private val multicastLock: WifiManager.MulticastLock =
@@ -38,8 +41,12 @@ class PhoneDiscovery(
     fun scan() {
         if (!running.get()) return
         val request = Discovery.request()
-        socket.send(DatagramPacket(request, request.size,
-            InetAddress.getByName("255.255.255.255"), Discovery.DISCOVERY_PORT))
+        socket.send(
+            DatagramPacket(
+                request, request.size,
+                InetAddress.getByName("255.255.255.255"), Discovery.DISCOVERY_PORT
+            )
+        )
     }
 
     private fun loop() {
@@ -48,14 +55,15 @@ class PhoneDiscovery(
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
-                if (!LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) continue
+                val sourceIp = packet.address.hostAddress ?: continue
                 val response = String(packet.data, 0, packet.length, Charsets.UTF_8)
-                val payload = Discovery.decodeResponse(response, System.currentTimeMillis() / 1000)
-                onDevice(payload)
+                val beacon = Discovery.decodeBeacon(response)
+                if (!Discovery.isAuthenticSource(sourceIp, beacon)) continue
+                onDevice(beacon)
             } catch (_: java.net.SocketTimeoutException) {
                 // Timeout keeps close() responsive.
             } catch (_: ProtocolException) {
-                // Ignore malformed or expired LAN announcements.
+                // Ignore malformed, unverified or non-beacon announcements.
             } catch (e: Exception) {
                 if (running.get()) Log.w(TAG, "Discovery receive failed", e)
             }

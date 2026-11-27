@@ -7,6 +7,7 @@ import java.util.LinkedHashMap
 const val VIDEO_HEADER_BYTES = 32
 const val MAX_UDP_DATAGRAM_BYTES = 1360
 const val MAX_VIDEO_PAYLOAD_BYTES = MAX_UDP_DATAGRAM_BYTES - VIDEO_HEADER_BYTES
+const val MAX_SEALED_VIDEO_PLAINTEXT_BYTES = MAX_VIDEO_PAYLOAD_BYTES - PacketSeal.TAG_BYTES
 const val DEFAULT_FRAME_DEADLINE_NS = 20_000_000L
 const val PRODUCTION_FRAME_DEADLINE_NS = 45_000_000L
 const val PLI_COALESCE_NS = 100_000_000L
@@ -47,23 +48,40 @@ data class VideoFragment(
             frameId: Long,
             fragmentIndex: Int,
             fragmentCount: Int,
-            captureTimestampNs: Long
+            captureTimestampNs: Long,
+            videoKey: ByteArray? = null
         ): ByteArray {
+            val encrypted = videoKey != null
+            val maxPlain = if (encrypted) MAX_SEALED_VIDEO_PLAINTEXT_BYTES else MAX_VIDEO_PAYLOAD_BYTES
             require(
                 flags in 0..255 &&
                     frameId in 0..0xffff_ffffL &&
                     fragmentCount in 1..65535 &&
                     fragmentIndex in 0 until fragmentCount &&
-                    payloadLength in 1..MAX_VIDEO_PAYLOAD_BYTES &&
+                    payloadLength in 1..maxPlain &&
                     offset >= 0 &&
                     offset + payloadLength <= source.size
             )
-            val out = ByteArray(VIDEO_HEADER_BYTES + payloadLength)
+            val wireLen = if (encrypted) payloadLength + PacketSeal.TAG_BYTES else payloadLength
+            val out = ByteArray(VIDEO_HEADER_BYTES + wireLen)
             val b = ByteBuffer.wrap(out).order(ByteOrder.BIG_ENDIAN)
             b.put(VIDEO_MAGIC).put(1.toByte()).put(flags.toByte()).putLong(sessionId).putInt(frameId.toInt())
-                .putShort(fragmentIndex.toShort()).putShort(fragmentCount.toShort()).putShort(payloadLength.toShort()).putShort(0)
+                .putShort(fragmentIndex.toShort()).putShort(fragmentCount.toShort()).putShort(wireLen.toShort()).putShort(0)
                 .putLong(captureTimestampNs)
-            source.copyInto(out, VIDEO_HEADER_BYTES, offset, offset + payloadLength)
+            if (encrypted) {
+                val aad = out.copyOf(VIDEO_HEADER_BYTES)
+                val sealed = PacketSeal.seal(
+                    videoKey!!,
+                    PacketSeal.videoNonce(frameId, fragmentIndex, fragmentCount),
+                    aad,
+                    source,
+                    payloadLength,
+                    offset
+                )
+                sealed.copyInto(out, VIDEO_HEADER_BYTES)
+            } else {
+                source.copyInto(out, VIDEO_HEADER_BYTES, offset, offset + payloadLength)
+            }
             return out
         }
 
@@ -114,18 +132,20 @@ object VideoFragmenter {
         frameId: Long,
         flags: Int,
         timestampNs: Long,
-        length: Int = frame.size
+        length: Int = frame.size,
+        videoKey: ByteArray? = null
     ): List<ByteArray> {
         require(length > 0 && length <= frame.size)
-        val count = (length + MAX_VIDEO_PAYLOAD_BYTES - 1) / MAX_VIDEO_PAYLOAD_BYTES
+        val chunkMax = if (videoKey != null) MAX_SEALED_VIDEO_PLAINTEXT_BYTES else MAX_VIDEO_PAYLOAD_BYTES
+        val count = (length + chunkMax - 1) / chunkMax
         require(count <= 4096)
         return List(count) { i ->
-            val from = i * MAX_VIDEO_PAYLOAD_BYTES
-            val partLen = minOf(length - from, MAX_VIDEO_PAYLOAD_BYTES)
+            val from = i * chunkMax
+            val partLen = minOf(length - from, chunkMax)
             var f = flags
             if (i == 0) f = f or 1
             if (i == count - 1) f = f or 2
-            VideoFragment.encodeRange(frame, from, partLen, f, sessionId, frameId, i, count, timestampNs)
+            VideoFragment.encodeRange(frame, from, partLen, f, sessionId, frameId, i, count, timestampNs, videoKey)
         }
     }
 }
@@ -143,7 +163,8 @@ class VideoReassembler(
     private val frameDeadlineNs: Long = DEFAULT_FRAME_DEADLINE_NS,
     private val maxInFlight: Int = 6,
     private val pliCoalesceNs: Long = PLI_COALESCE_NS,
-    private val maxFrameBytes: Int = 4 * 1024 * 1024
+    private val maxFrameBytes: Int = 4 * 1024 * 1024,
+    private val videoKey: ByteArray? = null
 ) {
     private data class Pending(
         val created: Long,
@@ -174,6 +195,27 @@ class VideoReassembler(
         if (newestCompleted?.let { h.frameId == it || older(h.frameId, it) } == true) {
             return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount + 1)
         }
+        val existing = pending[h.frameId]
+        if (existing != null && h.fragmentIndex < existing.parts.size && existing.parts[h.fragmentIndex] != null) {
+            return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount)
+        }
+        val plaintextPart = if (videoKey != null) {
+            try {
+                val aad = packet.copyOf(VIDEO_HEADER_BYTES)
+                PacketSeal.open(
+                    videoKey,
+                    PacketSeal.videoNonce(h.frameId, h.fragmentIndex, h.fragmentCount),
+                    aad,
+                    packet,
+                    h.payloadLength,
+                    VIDEO_HEADER_BYTES
+                )
+            } catch (_: Exception) {
+                return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount + 1, rejected = true)
+            }
+        } else {
+            null
+        }
         var dropped = expiredCount
         var needPli = expiredPli
         if (!pending.containsKey(h.frameId) && pending.size >= maxInFlight) {
@@ -191,13 +233,13 @@ class VideoReassembler(
         if (p.parts[h.fragmentIndex] != null) {
             return ReassemblyOutcome(requestPli = needPli, dropped = dropped)
         }
-        if (p.total + h.payloadLength > maxFrameBytes) {
+        val partBytes = plaintextPart ?: packet.copyOfRange(VIDEO_HEADER_BYTES, VIDEO_HEADER_BYTES + h.payloadLength)
+        if (p.total + partBytes.size > maxFrameBytes) {
             pending.remove(h.frameId)
             return ReassemblyOutcome(requestPli = shouldPli(nowNs) || needPli, dropped = dropped + 1, rejected = true)
         }
-        // Only allocate and slice fragment bytes after all metadata/duplicate/session checks pass.
-        p.parts[h.fragmentIndex] = packet.copyOfRange(VIDEO_HEADER_BYTES, VIDEO_HEADER_BYTES + h.payloadLength)
-        p.total += h.payloadLength
+        p.parts[h.fragmentIndex] = partBytes
+        p.total += partBytes.size
         p.received++
         if (p.received != p.count) {
             return ReassemblyOutcome(requestPli = needPli, dropped = dropped)

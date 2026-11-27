@@ -22,6 +22,8 @@ sealed interface ControlMessage {
     data class FragmentNack(val frameId:Long,val missingIndices:List<Int>):ControlMessage
     /** Receiver-measured loss, decoder backpressure, FPS, and decode latency feedback for ABR. */
     data class HealthFeedback(val reassemblyDropsDelta:Int,val backpressureDropsDelta:Int,val renderedFps:Int,val tvPipelineMs:Int):ControlMessage
+    /** Ephemeral ECDH P-256 public key exchange during SessionHandshake. */
+    data class KeyExchange(val publicKey:ByteArray):ControlMessage
     data class Error(val code:Int,val message:String):ControlMessage
 }
 
@@ -40,6 +42,7 @@ object ControlMessageCodec {
         is ControlMessage.AudioConfig->ControlType.AUDIO_CONFIG
         is ControlMessage.FragmentNack->ControlType.FRAGMENT_NACK
         is ControlMessage.HealthFeedback->ControlType.HEALTH_FEEDBACK
+        is ControlMessage.KeyExchange->ControlType.KEY_EXCHANGE
         is ControlMessage.Error->ControlType.ERROR
     }
     fun encode(m:ControlMessage):ByteArray {
@@ -63,6 +66,7 @@ object ControlMessageCodec {
                 buf.array()
             }
             is ControlMessage.HealthFeedback->ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN).putInt(m.reassemblyDropsDelta).putInt(m.backpressureDropsDelta).putInt(m.renderedFps).putInt(m.tvPipelineMs).array()
+            is ControlMessage.KeyExchange->{require(m.publicKey.size in 32..512);m.publicKey.copyOf()}
             is ControlMessage.Error->ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(m.code).array()+stringField(m.message,1024)
         }
         require(out.size<=MAX_CONTROL_PAYLOAD)
@@ -92,6 +96,7 @@ object ControlMessageCodec {
                     ControlMessage.FragmentNack(fid,indices)
                 }
                 ControlType.HEALTH_FEEDBACK->{exact(payload,16);ControlMessage.HealthFeedback(b.int,b.int,b.int,b.int)}
+                ControlType.KEY_EXCHANGE->{if(payload.size !in 32..512)throw ProtocolException("Invalid KEY_EXCHANGE");ControlMessage.KeyExchange(payload.copyOf())}
                 ControlType.ERROR->{if(payload.size<6)throw ProtocolException("Invalid ERROR");val code=b.int;val rest=ByteArray(b.remaining()).also(b::get);ControlMessage.Error(code,readStringField(rest,1024))}
             }
         } catch(e:ProtocolException){throw e}catch(e:Exception){throw ProtocolException("Malformed $type payload",e)}

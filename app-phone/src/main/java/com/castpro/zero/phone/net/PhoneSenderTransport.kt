@@ -61,6 +61,7 @@ class PhoneSenderTransport(
     private var udp: DatagramSocket? = null
     private var audioUdp: DatagramSocket? = null
     @Volatile private var sessionId = 0L
+    @Volatile private var sessionKeys: SessionKeys? = null
     @Volatile private var target: InetAddress? = null
     private var sequence = 2L
     private var frameId = 0L
@@ -90,7 +91,8 @@ class PhoneSenderTransport(
             control.keepAlive = true
             control.soTimeout = 5_000
             try { control.trafficClass = 0x10 } catch (_: Exception) {}
-            val sid = SessionHandshake.client(control, pairingToken)
+            val auth = SessionHandshake.clientWithKeys(control, pairingToken)
+            val sid = auth.sessionId
 
             video = DatagramSocket(null).apply {
                 if (binding != null) binding.bindUdp(this) else bind(InetSocketAddress(0))
@@ -106,6 +108,7 @@ class PhoneSenderTransport(
             tcp = control
             udp = video
             audioUdp = audioSocket
+            sessionKeys = auth.keys
             sessionId = sid
             running.set(true)
             Thread({ readControl() }, "CPZ-phone-control").start()
@@ -140,7 +143,9 @@ class PhoneSenderTransport(
                     sequence = sequence++,
                     sessionId = sessionId,
                     payload = ControlMessageCodec.encode(message)
-                )
+                ),
+                controlKey = sessionKeys?.controlKey,
+                direction = ControlFraming.DIRECTION_PHONE_TO_TV
             )
             true
         } catch (e: Exception) {
@@ -177,7 +182,8 @@ class PhoneSenderTransport(
         if (!running.get()) return@synchronized SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
         val currentFrameId = frameId++
         val fragments = VideoFragmenter.fragment(
-            bytes, sessionId, currentFrameId, if (keyframe) 4 else 0, timestampNs, length
+            bytes, sessionId, currentFrameId, if (keyframe) 4 else 0, timestampNs, length,
+            videoKey = sessionKeys?.videoKey
         )
         fragmentCache.put(currentFrameId, fragments.toTypedArray())
         val pacing = UdpBurstPacer.smoothPlan(fragments.size)
@@ -231,7 +237,7 @@ class PhoneSenderTransport(
         val destination = target ?: return@synchronized SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
         if (frame.sessionId != sessionId) return@synchronized SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
         return@synchronized try {
-            val data = frame.encode()
+            val data = frame.encode(sessionKeys?.audioKey)
             socket.send(DatagramPacket(data, data.size, destination, audioPort))
             bytesSent.addAndGet(data.size.toLong())
             audioFramesSent.incrementAndGet()
@@ -248,7 +254,11 @@ class PhoneSenderTransport(
             val input = socket.getInputStream()
             while (running.get()) {
                 val frame = try {
-                    ControlFraming.read(input) ?: break
+                    ControlFraming.read(
+                        input,
+                        controlKey = sessionKeys?.controlKey,
+                        expectedDirection = ControlFraming.DIRECTION_TV_TO_PHONE
+                    ) ?: break
                 } catch (_: SocketTimeoutException) {
                     if (System.nanoTime() - lastControlRxNs >= PEER_DEAD_TIMEOUT_NS) {
                         Log.w(TAG, "Control peer silent for >7s; closing stale transport")
@@ -307,6 +317,7 @@ class PhoneSenderTransport(
         udp = null
         audioUdp = null
         target = null
+        sessionKeys = null
     }
 
     private companion object {

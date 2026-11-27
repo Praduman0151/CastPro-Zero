@@ -36,6 +36,7 @@ class MainActivity : ComponentActivity() {
     private var qr by mutableStateOf<android.graphics.Bitmap?>(null)
     private var address by mutableStateOf("Searching for private Wi-Fi / Ethernet…")
     private var ipAddress by mutableStateOf<String?>(null)
+    private var pairingTokenState by mutableStateOf("")
     private var status by mutableStateOf("Starting TV receiver…")
     private var telemetry by mutableStateOf("Waiting for receiver telemetry")
     private var showHud by mutableStateOf(false)
@@ -71,6 +72,7 @@ class MainActivity : ComponentActivity() {
             override fun onAddress(ip: String, token: String) {
                 runOnUiThread {
                     ipAddress = ip
+                    pairingTokenState = token
                     address = "IP  $ip     TCP  45670     UDP  45671"
                 }
             }
@@ -96,13 +98,14 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             // Render ZXing QR bitmap strictly off the main UI thread and skip refresh while actively casting.
-            LaunchedEffect(ipAddress, hasRendered) {
+            LaunchedEffect(ipAddress, pairingTokenState, hasRendered) {
                 val ip = ipAddress ?: return@LaunchedEffect
+                val activeToken = pairingTokenState.ifBlank { receiver.pairingToken }
                 if (hasRendered) return@LaunchedEffect
                 while (!hasRendered) {
                     val bitmap = withContext(Dispatchers.Default) {
                         QrCode.pairingBitmap(
-                            ip, 45670, 45671, receiver.pairingToken,
+                            ip, 45670, 45671, activeToken,
                             System.currentTimeMillis() / 1000L + 3600L
                         )
                     }
@@ -147,6 +150,9 @@ class MainActivity : ComponentActivity() {
                             Text("CastPro-Zero", color = Color.White, style = MaterialTheme.typography.headlineLarge)
                             qr?.let { Image(it.asImageBitmap(), "Offline pairing QR code", Modifier.size(260.dp)) }
                             Text(address, color = Color.White, style = MaterialTheme.typography.titleMedium)
+                            if (pairingTokenState.isNotBlank()) {
+                                Text("Pairing code: $pairingTokenState", color = Color.LightGray, style = MaterialTheme.typography.bodySmall)
+                            }
                             Text(status, color = Color.LightGray)
                             Text("Scan this QR code from your phone on the same LAN", color = Color.LightGray)
                         }

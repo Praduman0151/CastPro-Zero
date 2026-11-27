@@ -50,13 +50,13 @@ import com.castpro.zero.phone.net.LocalNetworkBinding
 import com.castpro.zero.phone.net.PhoneDiscovery
 import com.castpro.zero.phone.BitrateSessionState
 import com.castpro.zero.phone.scan.OfflineQrAnalyzer
+import com.castpro.zero.protocol.LanDiscoveryBeacon
 import com.castpro.zero.protocol.SenderStats
-import com.castpro.zero.protocol.TvPairingPayload
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 private data class PhoneUiState(
-    val devices: Map<String, TvPairingPayload> = emptyMap(),
+    val devices: Map<String, LanDiscoveryBeacon> = emptyMap(),
     val selectedIp: String = "",
     val token: String = "",
     val manualIp: String = "",
@@ -137,14 +137,15 @@ class MainActivity : ComponentActivity() {
                             state = state,
                             lifecycleOwner = this,
                             onDiscover = { discovery?.scan() },
-                            onSelect = { payload ->
+                            onSelect = { beacon ->
+                                val keepToken = if (ui.value.selectedIp == beacon.ipAddress) ui.value.token else ""
                                 ui.value = ui.value.copy(
-                                    selectedIp = payload.ipAddress,
-                                    manualIp = payload.ipAddress,
-                                    token = payload.pairingToken,
-                                    tcpPort = payload.tcpPort.toString(),
-                                    udpPort = payload.udpPort.toString(),
-                                    message = "Selected TV at ${payload.ipAddress}"
+                                    selectedIp = beacon.ipAddress,
+                                    manualIp = beacon.ipAddress,
+                                    token = keepToken,
+                                    tcpPort = beacon.tcpPort.toString(),
+                                    udpPort = beacon.udpPort.toString(),
+                                    message = "Selected ${beacon.deviceName} (${beacon.ipAddress}). Scan TV QR or enter its pairing code."
                                 )
                             },
                             onManualIp = { value -> ui.value = ui.value.copy(manualIp = value, selectedIp = value) },
@@ -156,7 +157,7 @@ class MainActivity : ComponentActivity() {
                                 if (open) requestCameraPermission.launch(Manifest.permission.CAMERA)
                                 else ui.value = ui.value.copy(scanner = false)
                             },
-                            onQr = { value -> runOnUiThread { acceptQr(value) } },
+                            onQr = { value -> acceptQr(value) },
                             onStart = { validateAndStart() }
                         )
                     }
@@ -165,20 +166,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun acceptQr(text: String) {
-        try {
+    private fun acceptQr(text: String): Boolean {
+        return try {
             val target = PhoneTargetValidator.qr(text, System.currentTimeMillis() / 1000L)
-            ui.value = ui.value.copy(
-                selectedIp = target.ipAddress,
-                manualIp = target.ipAddress,
-                token = target.pairingToken,
-                tcpPort = target.tcpPort.toString(),
-                udpPort = target.udpPort.toString(),
-                scanner = false,
-                message = "Paired with ${target.ipAddress}. Select a bitrate and start casting."
-            )
+            runOnUiThread {
+                ui.value = ui.value.copy(
+                    selectedIp = target.ipAddress,
+                    manualIp = target.ipAddress,
+                    token = target.pairingToken,
+                    tcpPort = target.tcpPort.toString(),
+                    udpPort = target.udpPort.toString(),
+                    scanner = false,
+                    message = "Paired with ${target.ipAddress}. Select a bitrate and start casting."
+                )
+            }
+            true
         } catch (e: Exception) {
-            ui.value = ui.value.copy(message = "Invalid or expired pairing QR: ${e.message}")
+            runOnUiThread {
+                ui.value = ui.value.copy(message = "Invalid or expired pairing QR: ${e.message}")
+            }
+            false
         }
     }
 
@@ -230,12 +237,12 @@ class MainActivity : ComponentActivity() {
         PhoneSessionBus.onAudioChanged = { active -> runOnUiThread { ui.value = ui.value.copy(audioActive = active) } }
         PhoneSessionBus.onStatus = { value -> runOnUiThread { ui.value = ui.value.copy(message = value) } }
         try {
-            discovery = PhoneDiscovery(this, LocalNetworkBinding(this)) { payload ->
+            discovery = PhoneDiscovery(this, LocalNetworkBinding(this)) { beacon ->
                 runOnUiThread {
                     val current = ui.value
                     ui.value = current.copy(
-                        devices = current.devices + (payload.ipAddress to payload),
-                        message = "Found TV at ${payload.ipAddress}"
+                        devices = current.devices + (beacon.ipAddress to beacon),
+                        message = "Found ${beacon.deviceName} at ${beacon.ipAddress}"
                     )
                 }
             }
@@ -261,14 +268,14 @@ private fun SetupScreen(
     state: PhoneUiState,
     lifecycleOwner: LifecycleOwner,
     onDiscover: () -> Unit,
-    onSelect: (TvPairingPayload) -> Unit,
+    onSelect: (LanDiscoveryBeacon) -> Unit,
     onManualIp: (String) -> Unit,
     onTcpPort: (String) -> Unit,
     onUdpPort: (String) -> Unit,
     onToken: (String) -> Unit,
     onBitrate: (Int) -> Unit,
     onToggleScanner: (Boolean) -> Unit,
-    onQr: (String) -> Unit,
+    onQr: (String) -> Boolean,
     onStart: () -> Unit
 ) {
     Column(
@@ -286,7 +293,7 @@ private fun SetupScreen(
         Button(onClick = onDiscover) { Text("Discover TVs on this LAN") }
         state.devices.values.forEach { device ->
             Button(onClick = { onSelect(device) }, modifier = Modifier.fillMaxWidth()) {
-                Text("${device.ipAddress} · TCP ${device.tcpPort} / UDP ${device.udpPort}")
+                Text("${device.deviceName} · ${device.ipAddress} (TCP ${device.tcpPort})")
             }
         }
         OutlinedTextField(
@@ -341,7 +348,7 @@ private fun StreamingScreen(state: PhoneUiState, onStop: () -> Unit) {
 }
 
 @Composable
-private fun QrScanner(lifecycleOwner: LifecycleOwner, onQr: (String) -> Unit) {
+private fun QrScanner(lifecycleOwner: LifecycleOwner, onQr: (String) -> Boolean) {
     val context = LocalContext.current
     val previewView = remember { PreviewView(context) }
     val delivered = remember { AtomicBoolean(false) }
@@ -357,7 +364,9 @@ private fun QrScanner(lifecycleOwner: LifecycleOwner, onQr: (String) -> Unit) {
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                 analysis.setAnalyzer(executor, OfflineQrAnalyzer { value ->
-                    if (delivered.compareAndSet(false, true)) onQr(value)
+                    if (!delivered.get() && onQr(value)) {
+                        delivered.set(true)
+                    }
                 })
                 provider.unbindAll()
                 provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)

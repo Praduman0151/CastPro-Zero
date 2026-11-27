@@ -22,8 +22,12 @@ import kotlin.math.roundToLong
 
 class TvCastServer(
     private val callbacks: Callbacks = object : Callbacks {},
-    val pairingToken: String = createPairingToken()
+    initialPairingToken: String = createPairingToken()
 ) {
+    @Volatile var pairingToken: String = initialPairingToken
+        private set
+    @Volatile private var tokenIssuedEpochSec: Long = System.currentTimeMillis() / 1000L
+    private val failedAuthAttempts = AtomicInteger(0)
     interface Callbacks {
         fun onStatus(value: String) {}
         fun onAddress(ip: String, token: String) {}
@@ -73,6 +77,7 @@ class TvCastServer(
     private var videoQueue = TvVideoFrameQueue(capacity = 6)
     private val controlSendQueue = TvControlSendQueue(capacity = 64)
     private val fpsTracker = VsyncFpsTracker()
+    @Volatile private var sessionKeys: SessionKeys? = null
 
     private val dropped = AtomicLong(0L)
     private val bytesRenderedWindow = AtomicLong(0L)
@@ -222,11 +227,16 @@ class TvCastServer(
 
     private fun handleClientSession(socket: Socket) {
         var handshakeCounted = true
+        var authenticatedSession = false
         try {
             socket.soTimeout = 4_000
             socket.tcpNoDelay = true
             try { socket.trafficClass = 0x10 } catch (_: Exception) {}
-            val sid = SessionHandshake.server(socket, pairingToken)
+            val currentToken = activeTokenForAuth()
+            val auth = SessionHandshake.serverWithKeys(socket, currentToken)
+            val sid = auth.sessionId
+            failedAuthAttempts.set(0)
+            authenticatedSession = true
             activeHandshakes.decrementAndGet()
             handshakeCounted = false
 
@@ -234,6 +244,7 @@ class TvCastServer(
             val oldSocket = synchronized(this) {
                 val prev = control
                 control = socket
+                sessionKeys = auth.keys
                 sessionId = sid
                 authenticatedPeer = socket.inetAddress
                 authenticated = true
@@ -258,7 +269,11 @@ class TvCastServer(
             callbacks.onStatus("Authenticated phone session")
             val input = socket.getInputStream()
             while (running.get() && !socket.isClosed && authenticated && control === socket) {
-                val frame = ControlFraming.read(input) ?: break
+                val frame = ControlFraming.read(
+                    input,
+                    controlKey = sessionKeys?.controlKey,
+                    expectedDirection = ControlFraming.DIRECTION_PHONE_TO_TV
+                ) ?: break
                 if (frame.sessionId != sessionId) continue
                 when (val message = ControlMessageCodec.decode(frame.type, frame.payload)) {
                     is ControlMessage.StreamConfig -> {
@@ -304,7 +319,14 @@ class TvCastServer(
                 }
             }
         } catch (e: Exception) {
-            if (running.get()) Log.i(TAG, "Control peer disconnected", e)
+            if (!authenticatedSession && running.get()) {
+                val failures = failedAuthAttempts.incrementAndGet()
+                Log.w(TAG, "Authentication/handshake failed (attempt #$failures): ${e.message}")
+                if (failures >= 10) rotatePairingToken("Too many failed pairing attempts")
+                try { Thread.sleep(minOf(failures * 500L, 3_000L)) } catch (_: InterruptedException) {}
+            } else if (running.get()) {
+                Log.i(TAG, "Control peer disconnected", e)
+            }
         } finally {
             if (handshakeCounted) activeHandshakes.decrementAndGet()
             if (control === socket) {
@@ -333,7 +355,9 @@ class TvCastServer(
                         sequence = sequence.getAndIncrement(),
                         sessionId = sessionId,
                         payload = ControlMessageCodec.encode(msg)
-                    )
+                    ),
+                    controlKey = sessionKeys?.controlKey,
+                    direction = ControlFraming.DIRECTION_TV_TO_PHONE
                 )
             } catch (_: Exception) {
                 // Socket errors are cleaned up by the session control reader.
@@ -395,16 +419,32 @@ class TvCastServer(
         }, "CPZ-TV-discovery").start()
     }
 
-    /** Same wire format as the offline QR code, so phone discovery and scanning share one parser. */
-    private fun advertisement(ip: String): ByteArray = PairingPayloadCodec.encode(
-        TvPairingPayload(
+    /** Unauthenticated LAN discovery advertises IP/ports only — NEVER the secret pairing token. */
+    private fun advertisement(ip: String): ByteArray = Discovery.encodeBeacon(
+        LanDiscoveryBeacon(
             ipAddress = ip,
             tcpPort = TCP_PORT,
             udpPort = UDP_PORT,
-            pairingToken = pairingToken,
-            expiryEpochSeconds = System.currentTimeMillis() / 1000L + 3600L
+            deviceName = "CastPro-Zero TV"
         )
     ).toByteArray(Charsets.UTF_8)
+
+    private fun activeTokenForAuth(): String {
+        val nowSec = System.currentTimeMillis() / 1000L
+        if (!authenticated && nowSec - tokenIssuedEpochSec >= 3600L) {
+            rotatePairingToken("Expired idle pairing token")
+        }
+        return pairingToken
+    }
+
+    private fun rotatePairingToken(reason: String) {
+        val next = createPairingToken()
+        pairingToken = next
+        tokenIssuedEpochSec = System.currentTimeMillis() / 1000L
+        failedAuthAttempts.set(0)
+        Log.i(TAG, "Rotated pairing token: $reason")
+        privateAddress()?.address?.hostAddress?.let { ip -> callbacks.onAddress(ip, next) }
+    }
 
     private fun applyControlCsd(message: ControlMessage.VideoCsd) {
         val data = message.annexB
@@ -494,7 +534,7 @@ class TvCastServer(
                     continue
                 }
                 val frame = try {
-                    AudioFrame.decode(packet.data.copyOf(packet.length))
+                    AudioFrame.decode(packet.data, packet.length, sessionKeys?.audioKey)
                 } catch (_: Exception) {
                     continue
                 }
@@ -802,7 +842,12 @@ class TvCastServer(
                     continue
                 }
                 if (reassembler == null || reassemblerSession != sessionId) {
-                    reassembler = VideoReassembler(sessionId, frameDeadlineNs = PRODUCTION_FRAME_DEADLINE_NS, maxInFlight = 6)
+                    reassembler = VideoReassembler(
+                        sessionId,
+                        frameDeadlineNs = PRODUCTION_FRAME_DEADLINE_NS,
+                        maxInFlight = 6,
+                        videoKey = sessionKeys?.videoKey
+                    )
                     reassemblerSession = sessionId
                 }
                 val nowNs = System.nanoTime()
@@ -907,6 +952,7 @@ class TvCastServer(
     private fun clearSession(message: String) {
         authenticated = false
         authenticatedPeer = null
+        sessionKeys = null
         sessionId = 0L
         stream = null
         csd = null

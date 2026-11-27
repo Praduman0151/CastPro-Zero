@@ -66,7 +66,7 @@ class AudioCapture(
 
     private fun pump(rec: AudioRecord) {
         try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Exception) {}
-        val buffer = ByteArray(AudioCapturePolicy.CHUNK_BYTES)
+        val buffer = ByteArray(AudioCapturePolicy.SEALED_CHUNK_BYTES)
         val session = sender.sessionId()
         var sequence = 0L
         while (running) {
@@ -77,10 +77,12 @@ class AudioCapture(
                 break
             }
             if (read <= 0) break
+            val alignedRead = read - (read % AudioCapturePolicy.FRAME_BYTES)
+            if (alignedRead <= 0) continue
             val timestampNs = AudioCapturePolicy.safeTimestamp(System.nanoTime())
             var fatalSendFailure = false
             try {
-                for (chunk in AudioCapturePolicy.chunkPcm(buffer.copyOf(read))) {
+                for (chunk in AudioCapturePolicy.chunkPcm(buffer.copyOf(alignedRead), AudioCapturePolicy.SEALED_CHUNK_BYTES)) {
                     val outcome = sender.sendAudioFrame(AudioFrame(session, sequence++, timestampNs, chunk))
                     if (outcome is SendOutcome.NotSent && SendFailurePolicy.isFatal(outcome.failure)) {
                         Log.w(TAG, "Audio transmission stopped: ${SendFailurePolicy.message(outcome.failure)}")
