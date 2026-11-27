@@ -244,7 +244,7 @@ class PhoneCaptureService : Service() {
         sender?.sendStreamConfig(
             ControlMessage.StreamConfig(1, aligned.width, aligned.height, FPS, bitrate, 1, 3, 2)
         )
-        val queue = BoundedFrameQueue(capacity = 2, pool = framePool)
+        val queue = BoundedFrameQueue(capacity = 6, pool = framePool)
         frameQueue = queue
         frameLogCount = 0
         firstFrameLogged = false
@@ -499,6 +499,7 @@ class PhoneCaptureService : Service() {
             PhoneSessionBus.publish(telemetry.publishMeasured(transport.stats(fps, mbps, encName).copy(
                 resolution = "${activeWidth}×${activeHeight}", audioActive = audio?.isActive() == true
             )))
+            Log.i(TAG, "PHONE_STATS: fps=$fps mbps=${"%.2f".format(mbps)} res=${activeWidth}x${activeHeight} cong=${transport.congestionDropCount()}")
         }
     }
 
@@ -578,7 +579,7 @@ class PhoneCaptureService : Service() {
     }
 
     companion object {
-        private const val MAX_TX_FRAME_AGE_NS = 80_000_000L
+        private const val MAX_TX_FRAME_AGE_NS = 200_000_000L
         const val ACTION_STOP = "com.castpro.zero.phone.action.STOP"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"

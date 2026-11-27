@@ -9,7 +9,7 @@ const val MAX_UDP_DATAGRAM_BYTES = 1360
 const val MAX_VIDEO_PAYLOAD_BYTES = MAX_UDP_DATAGRAM_BYTES - VIDEO_HEADER_BYTES
 const val MAX_SEALED_VIDEO_PLAINTEXT_BYTES = MAX_VIDEO_PAYLOAD_BYTES - PacketSeal.TAG_BYTES
 const val DEFAULT_FRAME_DEADLINE_NS = 20_000_000L
-const val PRODUCTION_FRAME_DEADLINE_NS = 45_000_000L
+const val PRODUCTION_FRAME_DEADLINE_NS = 120_000_000L
 const val PLI_COALESCE_NS = 100_000_000L
 private val VIDEO_MAGIC = byteArrayOf(0x43, 0x5a)
 
@@ -289,7 +289,7 @@ class VideoReassembler(
     @Synchronized
     fun collectNacks(
         nowNs: Long,
-        nackDelayNs: Long = 8_000_000L,
+        nackDelayNs: Long = 5_000_000L,
         retryNs: Long = 10_000_000L,
         maxMissing: Int = 12
     ): List<ControlMessage.FragmentNack> {

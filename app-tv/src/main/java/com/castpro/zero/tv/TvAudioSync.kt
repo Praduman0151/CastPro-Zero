@@ -66,8 +66,8 @@ data class PlayableAudioChunk(val frame: AudioFrame, val offset: Int) {
  */
 class OrderedAudioPlaybackBuffer(
     private val sessionId: Long,
-    private val maxFrames: Int = 6,
-    private val expiryNs: Long = 100_000_000L
+    private val maxFrames: Int = 10,
+    private val expiryNs: Long = 160_000_000L
 ) {
     private val pending = TreeMap<Long, AudioFrame>()
     private var headOffset = 0

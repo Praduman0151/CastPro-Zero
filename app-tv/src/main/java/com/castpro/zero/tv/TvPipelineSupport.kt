@@ -49,7 +49,7 @@ data class FrameQueueOfferResult(
  * (CPZ-TV-decoder-feed). Ensures UDP socket receives never block on dequeueInputBuffer,
  * while preventing orphaned P-frames after overflow or packet loss.
  */
-class TvVideoFrameQueue(private val capacity: Int = 3) {
+class TvVideoFrameQueue(private val capacity: Int = 8) {
     private val lock = ReentrantLock()
     private val notEmpty = lock.newCondition()
     private val queue = ArrayDeque<ReassembledFrame>(capacity)
@@ -59,7 +59,7 @@ class TvVideoFrameQueue(private val capacity: Int = 3) {
     fun offer(
         frame: ReassembledFrame,
         senderNowNs: Long = frame.captureTimestampNs,
-        maxAgeNs: Long = 120_000_000L
+        maxAgeNs: Long = 250_000_000L
     ): FrameQueueOfferResult {
         val isKeyframe = (frame.flags and 4) != 0
         lock.withLock {

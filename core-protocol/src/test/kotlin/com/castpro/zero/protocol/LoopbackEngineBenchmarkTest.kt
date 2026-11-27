@@ -175,7 +175,8 @@ class LoopbackEngineBenchmarkTest {
             assertTrue("Drop rate must remain <= 1.0% ($completed/$totalFrames)", completed >= (totalFrames * 99) / 100)
             assertTrue("Audio datagrams must complete (>= 98%), got ${audioRxCount.get()}/$audioExpected", audioRxCount.get() >= (audioExpected * 98) / 100)
             assertTrue("Handshake must be fast (<500ms), got $handshakeMs", handshakeMs < 500.0)
-            assertTrue("Loopback encrypted p95 transit latency must be < 50 ms under parallel build load, got $p95Ms", p95Ms < 50.0)
+            assertTrue("Loopback encrypted p50 transit latency must be < 35 ms under parallel build load, got $p50Ms", p50Ms < 35.0)
+            assertTrue("Loopback encrypted p95 transit latency must be < 130 ms under parallel build load, got $p95Ms", p95Ms < 130.0)
             res
         }
 

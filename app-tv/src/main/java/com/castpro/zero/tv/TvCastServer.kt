@@ -486,7 +486,7 @@ class TvCastServer(
                 .setSampleRate(config.sampleRateHz)
                 .setChannelMask(channelMask)
                 .build()
-            val targetBufferBytes = maxOf(min, 2 * 3840) // ~40ms ceiling or hardware min
+            val targetBufferBytes = maxOf(min, 3 * 3840) // ~60ms ceiling or hardware min
             val builder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -658,7 +658,7 @@ class TvCastServer(
             pendingCsdForDecoder = csd?.copyOf() ?: data.copyOf()
             decoder = codecToStart
             decoderName = codecToStart.name
-            videoQueue = TvVideoFrameQueue(capacity = 3)
+            videoQueue = TvVideoFrameQueue(capacity = 8)
             Log.i(TAG, "Active decoder: $decoderName at ${cfg.width}x${cfg.height}@${cfg.fps}")
             Thread({ feedDecoder(codecToStart, videoQueue) }, "CPZ-TV-decoder-feed").start()
             Thread({ drainOutput(codecToStart) }, "CPZ-TV-output-drain").start()
@@ -851,7 +851,7 @@ class TvCastServer(
                     reassembler = VideoReassembler(
                         sessionId,
                         frameDeadlineNs = PRODUCTION_FRAME_DEADLINE_NS,
-                        maxInFlight = 6,
+                        maxInFlight = 10,
                         videoKey = sessionKeys?.videoKey
                     )
                     reassemblerSession = sessionId
@@ -882,7 +882,7 @@ class TvCastServer(
                             "RX frameId=${frame.frameId} fragCount=${(frame.bytes.size + MAX_VIDEO_PAYLOAD_BYTES - 1) / MAX_VIDEO_PAYLOAD_BYTES} size=${frame.bytes.size} keyframe=$keyframe NAL=$nalTypes"
                         )
                     }
-                    val offered = videoQueue.offer(frame, clockOffset.toSenderTimeNs(nowNs), 120_000_000L)
+                    val offered = videoQueue.offer(frame, clockOffset.toSenderTimeNs(nowNs), 250_000_000L)
                     if (offered.discontinuityRequired) {
                         dropped.incrementAndGet()
                         health.onDecoderBackpressure()
@@ -1026,7 +1026,9 @@ class TvCastServer(
                 lastLoss = 0L
                 lastBusy = 0L
             }
-            callbacks.onTelemetry(telemetry())
+            val snapText = telemetry()
+            if (authenticated) Log.i(TAG, "HUD: $snapText")
+            callbacks.onTelemetry(snapText)
         }
     }
 
