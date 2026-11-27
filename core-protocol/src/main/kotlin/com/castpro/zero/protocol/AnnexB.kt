@@ -32,16 +32,19 @@ object AnnexB {
 
 class DecodeGate(private val codec:VideoCodec) {
     enum class State { AWAITING_CSD, AWAITING_IDR, OPEN }
-    var state=State.AWAITING_CSD; private set
-    var parameterSets:CodecParameterSets?=null; private set
-    fun onCsd(data:ByteArray):Boolean {
+    // Control/attach threads mutate the gate; the UDP receive thread reads it per frame.
+    @Volatile var state=State.AWAITING_CSD; private set
+    @Volatile var parameterSets:CodecParameterSets?=null; private set
+    @Synchronized fun onCsd(data:ByteArray):Boolean {
         val sets=AnnexB.extract(data,codec) ?: return false
         parameterSets=sets; state=State.AWAITING_IDR; return true
     }
-    fun allowFrame(data:ByteArray):Boolean {
+    @Synchronized fun allowFrame(data:ByteArray):Boolean {
         if(state==State.AWAITING_CSD) return false
         if(state==State.AWAITING_IDR) { if(!AnnexB.isIdr(data,codec)) return false; state=State.OPEN }
         return state==State.OPEN
     }
-    fun resetForDiscontinuity() { state=if(parameterSets==null) State.AWAITING_CSD else State.AWAITING_IDR }
+    @Synchronized fun resetForDiscontinuity() { state=if(parameterSets==null) State.AWAITING_CSD else State.AWAITING_IDR }
+    /** A recreated decoder has no parameter sets, so no frame may reach it until CSD is queued again. */
+    @Synchronized fun onDecoderRecreated() { parameterSets = null; state = State.AWAITING_CSD }
 }

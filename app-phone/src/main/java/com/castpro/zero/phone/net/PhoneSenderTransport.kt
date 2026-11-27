@@ -25,13 +25,14 @@ class PhoneSenderTransport(
     private val running = AtomicBoolean(false)
     private var tcp: Socket? = null
     private var udp: DatagramSocket? = null
-    private var sessionId = 0L
+    @Volatile private var sessionId = 0L
+    @Volatile private var target: InetAddress? = null
     private var sequence = 2L
     private var frameId = 0L
-    data class VideoSendResult(val frameId: Long, val fragmentCount: Int, val byteCount: Int)
     private val framesSent = AtomicLong()
     private val bytesSent = AtomicLong()
     private val pliCount = AtomicLong()
+    private val audioFramesSent = AtomicLong()
     @Volatile private var rttMs = -1L
     @Volatile private var cachedCsd: Pair<Int, ByteArray>? = null
     @Volatile private var pingThread: Thread? = null
@@ -40,6 +41,7 @@ class PhoneSenderTransport(
         check(!running.get()) { "Transport already connected" }
         LocalAddressPolicy.requireAllowed(host)
         val address = InetAddress.getByName(host)
+        target = address
         val control = Socket()
         try {
             if (binding != null) binding.bindTcp(control) else control.bind(InetSocketAddress(0))
@@ -70,15 +72,29 @@ class PhoneSenderTransport(
         }
     }
 
-    @Synchronized fun sendControl(message: ControlMessage) {
-        check(running.get()) { "Pairing is required before control messages" }
-        val socket = tcp ?: error("TCP unavailable")
-        ControlFraming.write(socket.getOutputStream(), ControlFrame(
-            type = ControlMessageCodec.typeOf(message),
-            sequence = sequence++,
-            sessionId = sessionId,
-            payload = ControlMessageCodec.encode(message)
-        ))
+    /**
+     * Control writes after teardown are routine (PLI/CSD replies, ping, stop).
+     * Returning false instead of throwing keeps the pairing phrase out of error logs.
+     */
+    @Synchronized fun sendControl(message: ControlMessage): Boolean {
+        val socket = tcp
+        if (!running.get() || socket == null) return false
+        return try {
+            ControlFraming.write(socket.getOutputStream(), ControlFrame(
+                type = ControlMessageCodec.typeOf(message),
+                sequence = sequence++,
+                sessionId = sessionId,
+                payload = ControlMessageCodec.encode(message)
+            ))
+            true
+        } catch (e: Exception) {
+            val failure = SendFailurePolicy.classify(e)
+            if (SendFailurePolicy.isExpected(failure) || !running.get())
+                Log.w(TAG, SendFailurePolicy.message(failure))
+            else
+                Log.e(TAG, SendFailurePolicy.message(failure), e)
+            false
+        }
     }
 
     fun sendStreamConfig(config: ControlMessage.StreamConfig) = sendControl(config)
@@ -93,23 +109,47 @@ class PhoneSenderTransport(
 
     fun sendRttReport(rttMs: Long) = sendControl(ControlMessage.RttReport(rttMs))
 
-    @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime()): VideoSendResult {
-        check(running.get()) { "Pairing is required before UDP video" }
+    @Synchronized fun sendVideoFrame(bytes: ByteArray, keyframe: Boolean, timestampNs: Long = System.nanoTime()): SendOutcome {
+        // A closed transport and an unreachable LAN are ordinary teardown events.
+        // Reporting them through exceptions produced misleading "Pairing is required"
+        // stack traces on Wi-Fi loss, so they are returned as outcomes instead.
+        val socket = udp ?: return SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
+        val destination = target ?: return SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
+        if (!running.get()) return SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)
         val currentFrameId = frameId++
         val fragments = VideoFragmenter.fragment(bytes, sessionId, currentFrameId,
             if (keyframe) 4 else 0, timestampNs)
-        val socket = udp ?: error("UDP unavailable")
-        val target = InetAddress.getByName(host)
         val pacing = UdpBurstPacer.plan(fragments.size)
         fragments.forEachIndexed { index, data ->
             check(data.size <= MAX_UDP_DATAGRAM_BYTES)
-            socket.send(DatagramPacket(data, data.size, target, udpPort))
+            try {
+                socket.send(DatagramPacket(data, data.size, destination, udpPort))
+            } catch (e: Exception) {
+                return SendOutcome.NotSent(SendFailurePolicy.classify(e), e)
+            }
             bytesSent.addAndGet(data.size.toLong())
             if (pacing.pauseMicros > 0 && (index + 1) % pacing.burstSize == 0 && index + 1 < fragments.size)
                 LockSupport.parkNanos(pacing.pauseMicros * 1_000L)
         }
         framesSent.incrementAndGet()
-        return VideoSendResult(currentFrameId, fragments.size, bytes.size)
+        return SendOutcome.Sent(currentFrameId, fragments.size, bytes.size)
+    }
+
+    /** Device audio travels on its own authenticated datagram channel, derived from the video port. */
+    val audioPort: Int get() = udpPort + 2
+
+    fun sessionId(): Long = sessionId
+
+    fun sendAudioConfig(config: ControlMessage.AudioConfig) = sendControl(config)
+
+    @Synchronized fun sendAudioFrame(frame: AudioFrame) {
+        check(running.get()) { "Pairing is required before UDP audio" }
+        check(frame.sessionId == sessionId) { "Audio frame session id mismatch" }
+        val socket = udp ?: error("UDP unavailable")
+        val data = frame.encode()
+        socket.send(DatagramPacket(data, data.size, target ?: InetAddress.getByName(host), audioPort))
+        bytesSent.addAndGet(data.size.toLong())
+        audioFramesSent.incrementAndGet()
     }
 
     private fun readControl() {
@@ -144,6 +184,7 @@ class PhoneSenderTransport(
         framesSent = framesSent.get(),
         bytesSent = bytesSent.get(),
         pliCount = pliCount.get(),
+        audioFramesSent = audioFramesSent.get(),
         rttMs = rttMs,
         fps = fps,
         mbps = mbps,
@@ -158,6 +199,7 @@ class PhoneSenderTransport(
         try { udp?.close() } catch (_: Exception) {}
         tcp = null
         udp = null
+        target = null
     }
 
     private companion object { const val TAG = "CPZ-Phone-TCP" }

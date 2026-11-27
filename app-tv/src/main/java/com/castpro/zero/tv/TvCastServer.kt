@@ -1,5 +1,8 @@
 package com.castpro.zero.tv
 
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -34,8 +37,12 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     private val running = AtomicBoolean(false)
     @Volatile private var tcpServer: ServerSocket? = null
     @Volatile private var udp: DatagramSocket? = null
+    @Volatile private var audio: DatagramSocket? = null
     @Volatile private var discovery: DatagramSocket? = null
     @Volatile private var control: Socket? = null
+    @Volatile private var audioTrack: AudioTrack? = null
+    @Volatile private var audioQueue: AudioPlaybackQueue? = null
+    private val health = StreamHealthCounters()
     @Volatile private var decoder: MediaCodec? = null
     @Volatile private var surface: Surface? = null
     @Volatile private var sessionId = 0L
@@ -44,9 +51,9 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     @Volatile private var csd: ByteArray? = null
     @Volatile private var stream: ControlMessage.StreamConfig? = null
     @Volatile private var gate = DecodeGate(VideoCodec.AVC)
+    private val csdTracker = DecoderCsdTracker()
     @Volatile private var rendered = 0L
     @Volatile private var dropped = 0L
-    @Volatile private var pliCount = 0L
     private val rttState = RttTelemetryState()
     @Volatile private var bytesRenderedWindow = 0L
     @Volatile private var liveMbps = 0.0
@@ -69,6 +76,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     fun refreshNetwork() {
         try { tcpServer?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
+        try { audio?.close() } catch (_: Exception) {}
         try { control?.close() } catch (_: Exception) {}
     }
 
@@ -97,12 +105,23 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                 val ip = lan.address.hostAddress ?: continue
                 val tcp = ServerSocket(TCP_PORT, 4, lan.address)
                 val video = DatagramSocket(UDP_PORT, lan.address).apply { receiveBufferSize = 4 * 1024 * 1024; soTimeout = 100 }
-                Log.i("CPZ-TV", "UDP receive buffer requested=4 MiB actual=${video.receiveBufferSize}")
+                val audioSocket = try {
+                    DatagramSocket(TvReceiverPolicy.audioPortFor(UDP_PORT), lan.address).apply {
+                        receiveBufferSize = 2 * 1024 * 1024; soTimeout = 100
+                    }.also { audio = it }
+                } catch (e: Exception) {
+                    if (TvReceiverPolicy.audioFailureIsNonFatal()) {
+                        Log.w("CPZ-TV", "Audio receiver unavailable; video cast continues", e)
+                    }
+                    null
+                }
+                Log.i("CPZ-TV", "UDP receive buffer requested=4 MiB actual=${video.receiveBufferSize}; audio port=${TvReceiverPolicy.audioPortFor(UDP_PORT)} bound=${audioSocket != null}")
                 tcpServer = tcp; udp = video
                 callbacks.onAddress(ip, pairingToken)
                 callbacks.onStatus("Receiver ready · $ip")
                 startDiscoveryResponder()
                 Thread({ receiveVideo(video) }, "CPZ-TV-udp").start()
+                if (audioSocket != null) Thread({ receiveAudio(audioSocket) }, "CPZ-TV-udp-audio").start()
                 while (running.get() && !tcp.isClosed) {
                     try { handle(tcp.accept()) }
                     catch (e: SocketException) { if (running.get()) Log.i("CPZ-TV", "Network listener rebinding", e); break }
@@ -116,7 +135,8 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
             } finally {
                 try { tcpServer?.close() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
-                tcpServer = null; udp = null
+                try { audio?.close() } catch (_: Exception) {}
+                tcpServer = null; udp = null; audio = null
             }
         }
     }
@@ -190,6 +210,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
             firstTenFrames = 0
             firstRenderedFrameLogged = false
             lastPliNs = 0L
+            audioQueue = AudioPlaybackQueue(sid); health.reset()
             callbacks.onStatus("Authenticated phone session")
             val input = socket.getInputStream(); val output = socket.getOutputStream()
             while (running.get() && !socket.isClosed && authenticated) {
@@ -207,11 +228,14 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                         stream = message; resolution = "${message.width}×${message.height}"
                         callbacks.onStreamConfig(message); configureDecoderIfReady()
                     }
-                    is ControlMessage.VideoCsd -> {
-                        if (message.codec == 1 && gate.onCsd(message.annexB)) {
-                            csd = message.annexB.copyOf()
-                            configureDecoderIfReady()
-                        } else Log.w("CPZ-TV", "Rejected invalid Annex-B AVC CSD")
+                    is ControlMessage.VideoCsd -> applyControlCsd(message)
+                    is ControlMessage.AudioConfig -> {
+                        if (TvReceiverPolicy.isSupportedAudioConfig(
+                                message.sampleRateHz, message.channelCount, message.bitDepth, message.encoding)) {
+                            configureAudioTrack(message)
+                        } else {
+                            Log.w("CPZ-TV", "Rejected unsupported audio config: $message")
+                        }
                     }
                     is ControlMessage.Ping -> synchronized(socket) {
                         ControlFraming.write(output, ControlFrame(
@@ -238,6 +262,101 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         }
     }
 
+    /**
+     * A CSD control frame does not by itself prove the decoder has parameter sets.
+     * Only queueCsd() may open the gate, so a replay after a failed queue cannot
+     * send an IDR into a CSD-less decoder.
+     */
+    @Synchronized private fun applyControlCsd(message: ControlMessage.VideoCsd) {
+        val data = message.annexB
+        val valid = message.codec == 1 && AnnexB.extract(data, VideoCodec.AVC) != null
+        when (csdTracker.actionForControlCsd(decoder != null, valid)) {
+            CsdAction.REJECT -> Log.w("CPZ-TV", "Rejected invalid Annex-B AVC CSD")
+            CsdAction.CONFIGURE -> {
+                csd = data.copyOf()
+                configureDecoderIfReady()
+            }
+            CsdAction.QUEUE_NOW -> {
+                csd = data.copyOf()
+                decoder?.let { queueCsd(it, data) }
+            }
+            CsdAction.NONE -> csd = data.copyOf()
+        }
+    }
+
+    @Synchronized private fun configureAudioTrack(config: ControlMessage.AudioConfig) {
+        stopAudio()
+        try {
+            val channelMask = AudioFormat.CHANNEL_OUT_STEREO
+            val min = AudioTrack.getMinBufferSize(config.sampleRateHz, channelMask, AudioFormat.ENCODING_PCM_16BIT)
+            if (min <= 0) { Log.w("CPZ-TV", "AudioTrack minimum buffer unavailable: $min"); return }
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(config.sampleRateHz)
+                .setChannelMask(channelMask)
+                .build()
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(maxOf(min, 32 * 1024))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            track.play()
+            audioTrack = track
+            Log.i("CPZ-TV", "AudioTrack active: ${config.sampleRateHz} Hz stereo PCM16, minBuffer=$min")
+        } catch (e: Exception) {
+            Log.w("CPZ-TV", "AudioTrack setup failed", e)
+            stopAudio()
+        }
+    }
+
+    @Synchronized private fun stopAudio() {
+        val track = audioTrack; audioTrack = null
+        if (track != null) try { track.stop() } catch (_: Exception) {}
+        if (track != null) try { track.release() } catch (_: Exception) {}
+    }
+
+    /** Authenticated audio datagrams are written to AudioTrack in sequence order. */
+    private fun receiveAudio(socket: DatagramSocket) {
+        val bytes = ByteArray(MAX_UDP_DATAGRAM_BYTES)
+        var lastWrittenSequence = -1L
+        var lastSession = 0L
+        while (running.get() && !socket.isClosed) try {
+            val packet = DatagramPacket(bytes, bytes.size)
+            socket.receive(packet)
+            if (!authenticated) continue
+            if (packet.address != authenticatedPeer || !LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) continue
+            val frame = try { AudioFrame.decode(packet.data.copyOf(packet.length)) } catch (_: Exception) { continue }
+            if (frame.sessionId != sessionId) continue
+            val track = audioTrack ?: continue
+            val queue = audioQueue ?: continue
+            if (lastSession != sessionId) { lastSession = sessionId; lastWrittenSequence = -1L }
+            // The phone and TV have independent monotonic clock origins; stamp on arrival.
+            val arrivalNs = System.nanoTime()
+            val playable = queue.accept(frame.copy(timestampNs = arrivalNs), arrivalNs)
+            playable.forEach { candidate ->
+                if (candidate.sequence > lastWrittenSequence) {
+                    try {
+                        val written = track.write(candidate.pcm, 0, candidate.pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+                        if (TvReceiverPolicy.shouldAdvanceSequence(written, candidate.pcm.size)) {
+                            lastWrittenSequence = candidate.sequence
+                        }
+                        // A full/partial track buffer defers this datagram to the next arrival.
+                    } catch (_: Exception) {}
+                }
+            }
+        } catch (_: SocketTimeoutException) {
+            // Timeout exists to observe shutdown between packets.
+        } catch (e: SocketException) {
+            if (running.get() && !socket.isClosed) Log.w("CPZ-TV", "Audio UDP socket error", e)
+            break
+        } catch (e: Exception) {
+            if (running.get()) Log.w("CPZ-TV", "Audio UDP receive error", e)
+        }
+    }
+
     @Synchronized private fun configureDecoderIfReady() {
         val cfg = stream ?: return
         val data = csd ?: return
@@ -252,6 +371,10 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
             // Annex-B CSD is queued as a codec-config input buffer only after start(); no csd-0/csd-1 keys.
             codec.configure(format, target, null, 0)
             codec.start()
+            // Close the gap between exposing the decoder to receiveVideo() and
+            // reapplying CSD: a recreated decoder must gate every frame until then.
+            gate.onDecoderRecreated()
+            csdTracker.onDecoderCreated()
             decoder = codec
             decoderName = codec.name
             Log.i("CPZ-TV", "Active decoder: $decoderName")
@@ -266,23 +389,24 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
             Thread({ drainOutput(codec) }, "CPZ-TV-output-drain").start()
         } catch (e: Exception) {
             Log.e("CPZ-TV", "Decoder setup failed", e)
-            stopDecoder(); requestPli(2)
+            stopDecoder(); health.onSetupFailureOnly(); requestPli(2)
         }
     }
 
     private fun queueCsd(codec: MediaCodec, data: ByteArray) {
         if (AnnexB.extract(data, VideoCodec.AVC) == null) {
             Log.w("CPZ-TV", "Refusing invalid Annex-B AVC CSD after codec.start()")
-            requestPli(7)
+            health.onSetupFailureOnly(); requestPli(7)
             return
         }
         val index = codec.dequeueInputBuffer(10000)
-        if (index < 0) { Log.w("CPZ-TV", "No input buffer available for CSD"); requestPli(7); return }
-        val input = codec.getInputBuffer(index) ?: run { requestPli(7); return }
-        if (data.size > input.capacity()) { requestPli(7); return }
+        if (index < 0) { Log.w("CPZ-TV", "No input buffer available for CSD"); health.onSetupFailureOnly(); requestPli(7); return }
+        val input = codec.getInputBuffer(index) ?: run { health.onSetupFailureOnly(); requestPli(7); return }
+        if (data.size > input.capacity()) { health.onSetupFailureOnly(); requestPli(7); return }
         input.clear(); input.put(data)
         codec.queueInputBuffer(index, 0, data.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
-        gate.resetForDiscontinuity()
+        gate.onCsd(data)
+        csdTracker.onCsdQueued()
     }
 
     private fun drainOutput(codec: MediaCodec) {
@@ -335,7 +459,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
             if (fragment.sessionId != sessionId) { dropped++; continue }
             val result = reassembler.accept(raw, System.nanoTime())
             dropped += result.dropped
-            if (result.requestPli) requestPli(1)
+            if (result.requestPli) { health.onReassemblyDrop(); requestPli(1) }
             result.frames.forEach { frame ->
                 val nalTypes = AnnexB.nalUnits(frame.bytes).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
                 val keyframe = AnnexB.isIdr(frame.bytes, VideoCodec.AVC)
@@ -345,16 +469,21 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                 }
                 val codec = decoder ?: return@forEach
                 if (!gate.allowFrame(frame.bytes)) return@forEach
-                val index = codec.dequeueInputBuffer(0)
-                if (index < 0) { dropped++; requestPli(4); return@forEach }
+                val index = codec.dequeueInputBuffer(2_000)
+                if (index < 0) {
+                    // Decoder backpressure is NOT packet loss: never force an IDR here.
+                    dropped++; health.onDecoderBackpressure(); return@forEach
+                }
                 val input = codec.getInputBuffer(index) ?: return@forEach
-                if (frame.bytes.size > input.capacity()) { dropped++; requestPli(5); return@forEach }
+                if (frame.bytes.size > input.capacity()) { dropped++; health.onSetupFailureOnly(); requestPli(5); return@forEach }
                 input.clear(); input.put(frame.bytes)
                 codec.queueInputBuffer(index, 0, frame.bytes.size, frame.captureTimestampNs / 1000L, 0)
                 bytesRenderedWindow += frame.bytes.size
             }
         } catch (_: SocketTimeoutException) {
-            if (authenticated && reassembler?.expire(System.nanoTime()) == true) requestPli(1)
+            if (authenticated && reassembler?.expire(System.nanoTime()) == true) {
+                health.onReassemblyDrop(); requestPli(1)
+            }
         } catch (e: SocketException) {
             if (running.get() && !socket.isClosed) Log.w("CPZ-TV", "UDP socket error", e)
             break
@@ -369,7 +498,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         if (now - lastPliNs < PLI_COALESCE_NS) return
         val s = control ?: return
         lastPliNs = now
-        pliCount++
+        health.onPli(reason)
         try {
             synchronized(s) {
                 ControlFraming.write(s.getOutputStream(), ControlFrame(type = ControlType.PLI,
@@ -382,7 +511,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     fun attachSurface(target: Surface) {
         surface = target
         configureDecoderIfReady()
-        if (csd != null && stream != null) requestPli(6)
+        if (csd != null && stream != null) { requestPli(6) }
     }
 
     fun detachSurface() {
@@ -394,12 +523,16 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         authenticated = false; authenticatedPeer = null; sessionId = 0L
         stream = null; csd = null; gate = DecodeGate(VideoCodec.AVC)
         rttState.reset()
+        stopAudio(); audioQueue = null; health.reset()
         stopDecoder()
         callbacks.onSessionIdle()
         callbacks.onStatus(message)
     }
 
-    fun telemetry(): String = "Rendered FPS: $renderedFps · TCP RTT: ${if (rttState.rttMs >= 0) "${rttState.rttMs}ms" else "n/a"} · UDP dropped: $dropped · PLI: $pliCount · ${"%.2f".format(liveMbps)} Mbps · $resolution · $decoderName"
+    fun telemetry(): String {
+        val h = health.snapshot()
+        return "Rendered FPS: $renderedFps · TCP RTT: ${if (rttState.rttMs >= 0) "${rttState.rttMs}ms" else "n/a"} · UDP dropped: $dropped (${TvReceiverPolicy.formatHealth(h)}) · PLI: ${h.pliCount} · ${"%.2f".format(liveMbps)} Mbps · $resolution · $decoderName"
+    }
 
     private fun telemetryLoop() {
         var previous = System.nanoTime()
@@ -433,6 +566,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
 
     @Synchronized private fun stopDecoder() {
         val current = decoder; decoder = null
+        csdTracker.onDecoderStopped()
         if (current != null) try { current.stop() } catch (_: Exception) {}
         if (current != null) try { current.release() } catch (_: Exception) {}
         decoderName = "idle"
@@ -443,6 +577,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         clearSession("Receiver stopped")
         try { tcpServer?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
+        try { audio?.close() } catch (_: Exception) {}
         try { discovery?.close() } catch (_: Exception) {}
         try { control?.close() } catch (_: Exception) {}
     }

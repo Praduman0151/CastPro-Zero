@@ -66,6 +66,7 @@ private data class PhoneUiState(
     val sessionState: BitrateSessionState = BitrateSessionState(),
     val stats: SenderStats = SenderStats(),
     val streaming: Boolean = false,
+    val audioActive: Boolean = false,
     val scanner: Boolean = false,
     val message: String = "Discover a TV on this LAN or scan its offline QR code."
 )
@@ -75,6 +76,7 @@ class MainActivity : ComponentActivity() {
     private var discovery: PhoneDiscovery? = null
     private lateinit var projectionLauncher: ActivityResultLauncher<Intent>
     private lateinit var notificationPermissionLauncher: ActivityResultLauncher<String>
+    private lateinit var audioPermissionLauncher: ActivityResultLauncher<String>
     private var continueAfterNotificationPrompt = false
 
     private val requestCameraPermission: ActivityResultLauncher<String> =
@@ -111,8 +113,14 @@ class MainActivity : ComponentActivity() {
                     if (!granted) ui.value = ui.value.copy(
                         message = "Notifications are disabled; continuing with the foreground capture service."
                     )
-                    requestProjectionConsent()
+                    ensureAudioPermission()
                 }
+            }
+        // Audio is best-effort: a denial must not block the video cast.
+        audioPermissionLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                if (!granted) ui.value = ui.value.copy(message = "Audio permission denied; casting video only.")
+                requestProjectionConsent()
             }
 
         setContent {
@@ -193,10 +201,18 @@ class MainActivity : ComponentActivity() {
                 continueAfterNotificationPrompt = true
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             } else {
-                requestProjectionConsent()
+                ensureAudioPermission()
             }
         } catch (e: Exception) {
             ui.value = ui.value.copy(message = "Receiver details are invalid: ${e.message}")
+        }
+    }
+
+    private fun ensureAudioPermission() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            requestProjectionConsent()
         }
     }
 
@@ -211,6 +227,8 @@ class MainActivity : ComponentActivity() {
         PhoneSessionBus.onStreamingChanged = { active ->
             runOnUiThread { ui.value = ui.value.copy(streaming = active, sessionState = if (active) ui.value.sessionState.connectedNow() else ui.value.sessionState.stopped()) }
         }
+        PhoneSessionBus.onAudioChanged = { active -> runOnUiThread { ui.value = ui.value.copy(audioActive = active) } }
+        PhoneSessionBus.onStatus = { value -> runOnUiThread { ui.value = ui.value.copy(message = value) } }
         try {
             discovery = PhoneDiscovery(this, LocalNetworkBinding(this)) { payload ->
                 runOnUiThread {
@@ -232,6 +250,8 @@ class MainActivity : ComponentActivity() {
         discovery = null
         PhoneSessionBus.onStats = null
         PhoneSessionBus.onStreamingChanged = null
+        PhoneSessionBus.onAudioChanged = null
+        PhoneSessionBus.onStatus = null
         super.onStop()
     }
 }
@@ -315,6 +335,7 @@ private fun StreamingScreen(state: PhoneUiState, onStop: () -> Unit) {
         Text("${stats.fps} fps · ${String.format("%.2f", stats.mbps)} Mbps · ${stats.codec} · ${stats.resolution}")
         Text("TCP RTT: ${if (stats.rttMs < 0) "—" else "${stats.rttMs} ms"} · PLI: ${stats.pliCount}")
         Text("Frames sent: ${stats.framesSent} · bytes: ${stats.bytesSent}")
+        Text("Audio: ${if (state.audioActive) "on" else "off"} · audio datagrams: ${stats.audioFramesSent}")
         Button(onClick = onStop) { Text("Stop Casting") }
     }
 }

@@ -1,11 +1,13 @@
 package com.castpro.zero.phone.capture
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -21,12 +23,17 @@ import android.os.IBinder
 import android.util.Log
 import android.view.Surface
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.castpro.zero.phone.PhoneSessionBus
 import com.castpro.zero.phone.net.LocalNetworkBinding
 import com.castpro.zero.phone.net.PhoneSenderTransport
+import com.castpro.zero.phone.net.SendFailure
+import com.castpro.zero.phone.net.SendFailurePolicy
+import com.castpro.zero.phone.net.SendOutcome
 import com.castpro.zero.protocol.AnnexB
 import com.castpro.zero.protocol.ControlMessage
 import com.castpro.zero.protocol.VideoCodec
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -41,8 +48,13 @@ class PhoneCaptureService : Service() {
     private var surface: Surface? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var sender: PhoneSenderTransport? = null
+    private var audio: AudioCapture? = null
     private val active = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
+    private val telemetry = SenderTelemetryState()
+    private val startup = OffThreadStartup(
+        Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "CPZ-capture-startup") }
+    )
     private var frameLogCount = 0
     private var firstFrameLogged = false
 
@@ -76,15 +88,18 @@ class PhoneCaptureService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        // Network I/O and projection/encoder setup must not run on the main thread.
+        startup.execute {
+        if (stopping.get()) return@execute
         try {
             val binding = LocalNetworkBinding(this)
             sender = PhoneSenderTransport(host, tcpPort, udpPort, token,
                 onPli = {
                     Log.i(TAG, "PLI received; cached CSD replayed and sync frame requested")
-                    sender?.stats()?.copy(resolution = "${WIDTH}×${HEIGHT}")?.let(PhoneSessionBus::publish)
+                    sender?.stats()?.pliCount?.let { telemetry.onPli(it) }?.let(PhoneSessionBus::publish)
                 },
                 onRtt = { measured ->
-                    sender?.stats()?.copy(rttMs = measured, resolution = "${WIDTH}×${HEIGHT}")?.let(PhoneSessionBus::publish)
+                    telemetry.onRtt(measured)?.let(PhoneSessionBus::publish)
                 },
                 onSyncFrameRequest = {
                     try {
@@ -97,6 +112,7 @@ class PhoneCaptureService : Service() {
                 },
                 binding = binding
             ).also { it.connect() }
+            if (stopping.get()) { teardown(); return@execute }
 
             // Fresh one-use consent data is required for every projection session.
             projection = getSystemService(MediaProjectionManager::class.java)
@@ -114,9 +130,32 @@ class PhoneCaptureService : Service() {
                 }
             }, Handler(mainLooper))
             startEncoder(BitrateOptions.toBps(intent.getIntExtra(EXTRA_BITRATE, BitrateOptions.DEFAULT_MBPS)))
+            if (stopping.get()) { teardown(); return@execute }
+            val current = sender
+            val currentProjection = projection
+            if (current != null && currentProjection != null && AudioCapturePolicy.shouldCapture(
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
+                    true
+                )) {
+                try {
+                    val capture = AudioCapture(currentProjection, current, PhoneSessionBus::publishAudio)
+                    audio = capture
+                    capture.start()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Audio capture unavailable; continuing video cast", e)
+                    try { audio?.close() } catch (_: Exception) {}
+                    audio = null
+                    PhoneSessionBus.publishAudio(false)
+                }
+            } else {
+                Log.i(TAG, "Audio capture skipped (permission or projection unavailable); video cast continues")
+                PhoneSessionBus.publishAudio(false)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Projection startup failed", e)
-            stopCapture()
+            stopping.set(true)
+            teardown()
+        }
         }
         return START_NOT_STICKY
     }
@@ -175,16 +214,22 @@ class PhoneCaptureService : Service() {
                                 Log.i(TAG, "First transmitted frame wall-clock=${System.nanoTime()} ns, codec=${enc.name}")
                             }
                             // Every encoded access unit is sent; no drop path exists.
-                            val sent = sender?.sendVideoFrame(data, isKeyframe, info.presentationTimeUs * 1_000L)
-                                ?: error("Sender transport unavailable")
-                            if (!firstFrameLogged) {
-                                firstFrameLogged = true
-                                Log.i(TAG, "First transmitted frame from ${enc.name} at ${info.presentationTimeUs}us")
-                            }
-                            if (frameLogCount < 10) {
-                                frameLogCount++
-                                val nalTypes = AnnexB.nalUnits(data).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
-                                Log.i(TAG, "TX frameId=${sent.frameId} fragCount=${sent.fragmentCount} size=${sent.byteCount} keyframe=$isKeyframe NAL=$nalTypes")
+                            when (val outcome = sender?.sendVideoFrame(data, isKeyframe, info.presentationTimeUs * 1_000L)
+                                ?: SendOutcome.NotSent(SendFailure.TRANSPORT_CLOSED)) {
+                                is SendOutcome.Sent -> {
+                                    if (frameLogCount < 10) {
+                                        frameLogCount++
+                                        val nalTypes = AnnexB.nalUnits(data).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
+                                        Log.i(TAG, "TX frameId=${outcome.frameId} fragCount=${outcome.fragmentCount} size=${outcome.byteCount} keyframe=$isKeyframe NAL=$nalTypes")
+                                    }
+                                }
+                                is SendOutcome.NotSent -> {
+                                    val message = SendFailurePolicy.message(outcome.failure)
+                                    if (SendFailurePolicy.isExpected(outcome.failure)) Log.w(TAG, message)
+                                    else Log.e(TAG, message, outcome.cause)
+                                    PhoneSessionBus.publishStatus(message)
+                                    active.set(false)
+                                }
                             }
                         }
                     }
@@ -232,12 +277,21 @@ class PhoneCaptureService : Service() {
             last = now
             lastFrames = snapshot.framesSent
             lastBytes = snapshot.bytesSent
-            PhoneSessionBus.publish(transport.stats(fps, mbps, enc.name).copy(resolution = "${WIDTH}×${HEIGHT}"))
+            PhoneSessionBus.publish(telemetry.publishMeasured(transport.stats(fps, mbps, enc.name).copy(
+                resolution = "${WIDTH}×${HEIGHT}", audioActive = audio?.isActive() == true
+            )))
         }
     }
 
     private fun stopCapture() {
         if (!stopping.compareAndSet(false, true)) return
+        startup.cancel()
+        telemetry.reset()
+        teardown()
+    }
+
+    /** Idempotent resource release; safe to call again from a racing startup block. */
+    private fun teardown() {
         active.set(false)
         try { display?.release() } catch (_: Exception) {}
         display = null
@@ -249,6 +303,9 @@ class PhoneCaptureService : Service() {
         projection = null
         try { wifiLock?.release() } catch (_: Exception) {}
         wifiLock = null
+        try { audio?.close() } catch (_: Exception) {}
+        audio = null
+        PhoneSessionBus.publishAudio(false)
         try { sender?.sendControl(ControlMessage.Stop(0)) } catch (_: Exception) {}
         try { sender?.close() } catch (_: Exception) {}
         sender = null

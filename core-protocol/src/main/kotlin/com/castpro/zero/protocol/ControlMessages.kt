@@ -16,6 +16,8 @@ sealed interface ControlMessage {
     data class Stop(val reason:Int):ControlMessage
     /** Phone-measured RTT, reported back to the TV for its on-screen HUD. */
     data class RttReport(val rttMs:Long):ControlMessage
+    /** Device audio format; sent on the TCP control channel before audio UDP frames. */
+    data class AudioConfig(val sampleRateHz:Int,val channelCount:Int,val bitDepth:Int,val encoding:Int):ControlMessage
     data class Error(val code:Int,val message:String):ControlMessage
 }
 
@@ -31,6 +33,7 @@ object ControlMessageCodec {
         is ControlMessage.Pli->ControlType.PLI
         is ControlMessage.Stop->ControlType.STOP
         is ControlMessage.RttReport->ControlType.RTT_REPORT
+        is ControlMessage.AudioConfig->ControlType.AUDIO_CONFIG
         is ControlMessage.Error->ControlType.ERROR
     }
     fun encode(m:ControlMessage):ByteArray {
@@ -45,6 +48,7 @@ object ControlMessageCodec {
             is ControlMessage.Pli->byteArrayOf(m.reason.toByte())
             is ControlMessage.Stop->ByteBuffer.allocate(2).order(ByteOrder.BIG_ENDIAN).putShort(m.reason.toShort()).array()
             is ControlMessage.RttReport->ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(m.rttMs).array()
+            is ControlMessage.AudioConfig->ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN).putInt(m.sampleRateHz).putInt(m.channelCount).putInt(m.bitDepth).putInt(m.encoding).array()
             is ControlMessage.Error->ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(m.code).array()+stringField(m.message,1024)
         }
         require(out.size<=MAX_CONTROL_PAYLOAD)
@@ -65,6 +69,7 @@ object ControlMessageCodec {
                 ControlType.PLI->{exact(payload,1);ControlMessage.Pli(b.get().toInt() and 255)}
                 ControlType.STOP->{exact(payload,2);ControlMessage.Stop(b.short.toInt() and 65535)}
                 ControlType.RTT_REPORT->{exact(payload,8);ControlMessage.RttReport(b.long)}
+                ControlType.AUDIO_CONFIG->{exact(payload,16);ControlMessage.AudioConfig(b.int,b.int,b.int,b.int)}
                 ControlType.ERROR->{if(payload.size<6)throw ProtocolException("Invalid ERROR");val code=b.int;val rest=ByteArray(b.remaining()).also(b::get);ControlMessage.Error(code,readStringField(rest,1024))}
             }
         } catch(e:ProtocolException){throw e}catch(e:Exception){throw ProtocolException("Malformed $type payload",e)}

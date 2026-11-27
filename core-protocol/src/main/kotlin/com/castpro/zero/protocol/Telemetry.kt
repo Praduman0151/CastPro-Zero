@@ -9,5 +9,7 @@ data class SenderStats(
     val fps: Int = 0,
     val mbps: Float = 0f,
     val codec: String = "idle",
-    val resolution: String = "—"
+    val resolution: String = "—",
+    val audioFramesSent: Long = 0,
+    val audioActive: Boolean = false
 )
