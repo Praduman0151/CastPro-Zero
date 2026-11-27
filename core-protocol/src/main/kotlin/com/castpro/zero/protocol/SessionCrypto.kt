@@ -133,7 +133,9 @@ object PacketSeal {
         aad: ByteArray?,
         plaintext: ByteArray,
         length: Int = plaintext.size,
-        offset: Int = 0
+        offset: Int = 0,
+        aadOffset: Int = 0,
+        aadLength: Int = aad?.size ?: 0
     ): ByteArray {
         require(key.size == 32 && nonce.size == NONCE_BYTES)
         require(offset >= 0 && length >= 0 && offset + length <= plaintext.size)
@@ -141,8 +143,30 @@ object PacketSeal {
         val spec = if (chaChaSupported) IvParameterSpec(nonce) else GCMParameterSpec(TAG_BYTES * 8, nonce)
         val keyAlgo = if (chaChaSupported) "ChaCha20" else "AES"
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, keyAlgo), spec)
-        if (aad != null && aad.isNotEmpty()) cipher.updateAAD(aad)
+        if (aad != null && aadLength > 0) cipher.updateAAD(aad, aadOffset, aadLength)
         return cipher.doFinal(plaintext, offset, length)
+    }
+
+    /** Encrypts directly into `dest[destOffset..]` with zero intermediate array allocations. */
+    fun sealInto(
+        key: ByteArray,
+        nonce: ByteArray,
+        aad: ByteArray,
+        aadOffset: Int,
+        aadLength: Int,
+        plaintext: ByteArray,
+        offset: Int,
+        length: Int,
+        dest: ByteArray,
+        destOffset: Int
+    ): Int {
+        require(key.size == 32 && nonce.size == NONCE_BYTES)
+        val cipher = threadLocalSealCipher.get()
+        val spec = if (chaChaSupported) IvParameterSpec(nonce) else GCMParameterSpec(TAG_BYTES * 8, nonce)
+        val keyAlgo = if (chaChaSupported) "ChaCha20" else "AES"
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, keyAlgo), spec)
+        if (aadLength > 0) cipher.updateAAD(aad, aadOffset, aadLength)
+        return cipher.doFinal(plaintext, offset, length, dest, destOffset)
     }
 
     fun open(
@@ -151,7 +175,9 @@ object PacketSeal {
         aad: ByteArray?,
         ciphertext: ByteArray,
         length: Int = ciphertext.size,
-        offset: Int = 0
+        offset: Int = 0,
+        aadOffset: Int = 0,
+        aadLength: Int = aad?.size ?: 0
     ): ByteArray {
         require(key.size == 32 && nonce.size == NONCE_BYTES)
         if (offset < 0 || length < TAG_BYTES || offset + length > ciphertext.size) {
@@ -172,7 +198,7 @@ object PacketSeal {
                     throw e
                 }
             }
-            if (aad != null && aad.isNotEmpty()) cipher.updateAAD(aad)
+            if (aad != null && aadLength > 0) cipher.updateAAD(aad, aadOffset, aadLength)
             cipher.doFinal(ciphertext, offset, length)
         } catch (e: Exception) {
             throw ProtocolException("Packet authentication failed", e)

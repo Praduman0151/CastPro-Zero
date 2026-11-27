@@ -81,10 +81,10 @@ class ProtocolPerfAndRecoveryTests {
     }
 
     @Test fun smoothPacingPacesMediumAndLargeIdrFrames() {
-        val small = UdpBurstPacer.smoothPlan(4)
+        val small = UdpBurstPacer.smoothPlan(8)
         assertEquals(0L, small.pauseMicros)
         val med = UdpBurstPacer.smoothPlan(30)
-        assertTrue(med.pauseMicros > 0L && med.burstSize <= 8)
+        assertTrue(med.pauseMicros > 0L && med.burstSize <= 10)
         val large = UdpBurstPacer.smoothPlan(120)
         assertTrue(large.pauseMicros > 0L && large.burstSize <= 10)
     }

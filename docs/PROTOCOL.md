@@ -1,42 +1,61 @@
-# CastPro-Zero Protocol v1
+# CastPro-Zero Protocol v1 / v2
 
 ## Roles
-The TCL TV is always the TCP control server, UDP video receiver, and QR display. The OnePlus phone is always the QR scanner / control client / video sender. QR pairing, local UDP broadcast discovery, and manual IP entry converge on the same TV endpoint and work on an isolated LAN or phone hotspot.
+The TCL TV is always the TCP control server, UDP video/audio receiver, and QR display. The OnePlus phone is always the QR scanner / control client / video+audio sender. LAN discovery, QR pairing, and manual IP entry converge on the same TV endpoint and work strictly on an isolated LAN or phone hotspot.
 
-## Session identity
-One random 64-bit SessionId is created per session and reused unchanged in the 24-byte TCP header and 32-byte UDP video header.
+## Session Identity & Security
+- One random **non-zero** 64-bit `SessionId` is created per session (`SessionIds.newSessionId()`) and validated across TCP and UDP headers.
+- **Zero cleartext pairing token on wire:**
+  - LAN UDP broadcast beacons (`CPZ0-LAN`, port `45672`) carry endpoint identity (`version`, `ipAddress`, `tcpPort`, `udpPort`, `deviceName`) only — **never** the secret `pairingToken`.
+  - During `HELLO` / `HELLO_ACK` / `PAIR_CONFIRM`, client and server exchange 16-byte random nonces and prove knowledge of `pairingToken` via constant-time `HMAC-SHA256("CPZ0-PAIR-AUTHv2" || sessionId || clientNonce || serverNonce)`.
+  - Ephemeral ECDH (`secp256r1` / P-256) `KEY_EXCHANGE` derives independent 256-bit `controlKey`, `videoKey`, and `audioKey` via HKDF-SHA256.
+  - All post-handshake TCP control frames, UDP video fragments, and UDP audio datagrams are encrypted and authenticated with `ChaCha20-Poly1305` AEAD (headers authenticated via AAD; deterministic nonces prevent IV reuse).
 
-## TCP control header (24 bytes, big-endian)
+## TCP Control Header (24 bytes, big-endian)
 | Offset | Bytes | Field |
 |---:|---:|---|
-| 0 | 4 | ASCII CPZ0 |
-| 4 | 1 | version (1) |
+| 0 | 4 | ASCII `CPZ0` |
+| 4 | 1 | version (`1`) |
 | 5 | 1 | message type |
-| 6 | 2 | flags |
-| 8 | 4 | payload length (0..65536) |
-| 12 | 4 | sequence |
-| 16 | 8 | SessionId |
+| 6 | 2 | flags (`bit 0` = AEAD encrypted) |
+| 8 | 4 | payload length (`0..65536`) |
+| 12 | 4 | sequence (`uint32`) |
+| 16 | 8 | `SessionId` |
 
-Message IDs: HELLO=01, HELLO_ACK=02, PAIR_CONFIRM=03, STREAM_CONFIG=10, VIDEO_CSD=11, PING=20, PONG=21, PLI=22, STOP=23, ERROR=7F. TCP readers must consume the full header and payload even when the stream returns short reads.
+Message IDs: `HELLO=1`, `HELLO_ACK=2`, `PAIR_CONFIRM=3`, `STREAM_CONFIG=16`, `VIDEO_CSD=17`, `PING=32`, `PONG=33`, `PLI=34`, `STOP=35`, `RTT_REPORT=36`, `AUDIO_CONFIG=37`, `FRAGMENT_NACK=38`, `HEALTH_FEEDBACK=39`, `KEY_EXCHANGE=40`, `ERROR=127`.
 
-## UDP video header (32 bytes, big-endian)
+## UDP Video Header (32 bytes, big-endian, port `udpPort` default `45671`)
 | Offset | Bytes | Field |
 |---:|---:|---|
-| 0 | 2 | ASCII CZ |
-| 2 | 1 | version |
-| 3 | 1 | flags |
-| 4 | 8 | same SessionId |
-| 12 | 4 | frameId |
+| 0 | 2 | ASCII `CZ` |
+| 2 | 1 | version (`1`) |
+| 3 | 1 | flags (`1=first`, `2=last`, `4=keyframe`) |
+| 4 | 8 | `SessionId` |
+| 12 | 4 | `frameId` (`uint32`) |
 | 16 | 2 | fragment index |
 | 18 | 2 | fragment count |
-| 20 | 2 | payload length |
+| 20 | 2 | wire payload length (`plaintext + 16B AEAD tag` when encrypted) |
 | 22 | 2 | reserved |
-| 24 | 8 | captureTimestampNs |
+| 24 | 8 | `captureTimestampNs` |
 
-Datagram maximum is 1360 bytes, leaving 1328 bytes for video data. Reassembly is capped at three frames, four MiB per frame, and 4096 fragments. Incomplete frames expire after 20 ms. PLI requests are coalesced to one per 100 ms. Duplicate fragments are ignored; out-of-order fragments are supported; stale and wrong-session packets are rejected.
+Datagram ceiling is `1360` bytes (`1312` B plaintext video when sealed + `16` B Poly1305 tag + `32` B header). Production `VideoReassembler` keeps up to `6` in-flight frames with `45 ms` deadline and issues coalesced `FRAGMENT_NACK` at `8 ms` for missing packets before falling back to `100 ms` coalesced `PLI`.
 
-## CSD and decode gate
-AVC requires Annex-B SPS (NAL type 7) and PPS (type 8). HEVC requires VPS/SPS/PPS (types 32/33/34). No frame is released to a decoder until validated parameter sets have arrived and an IDR/IRAP access unit is received.
+## UDP Audio Header (32 bytes, big-endian, port `udpPort + 2` default `45673`)
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 2 | ASCII `CA` |
+| 2 | 1 | version (`1`) |
+| 3 | 1 | flags (`bit 0` = AEAD encrypted) |
+| 4 | 8 | `SessionId` |
+| 12 | 8 | sequence (`uint64`) |
+| 20 | 8 | `timestampNs` |
+| 28 | 2 | wire payload length |
+| 30 | 2 | reserved |
 
-## TV-origin pairing payload
-QR payload is URL-safe Base64 without padding of seven UTF-8 newline-separated fields: CPZ0, version, numeric TV IP, TCP port, UDP port, pairing token, expiry epoch seconds. The token is generated by the TV and expires; the phone confirms it over TCP. The QR is shown by the TV, never scanned by it.
+Carries `48 kHz` stereo 16-bit PCM chunks (`<= 1312` bytes plaintext when AEAD-sealed, matching `AudioPlaybackCapture` → `OrderedAudioPlaybackBuffer` + `AvSyncController`).
+
+## CSD & Decode Gate
+AVC requires Annex-B SPS (`NAL type 7`) and PPS (`8`). HEVC requires VPS/SPS/PPS (`32/33/34`). No P-frame enters `MediaCodec` until validated CSD has been queued onto the decoder input thread and an IDR (`NAL 5` / `19..21`) passes `DecodeGate`; packet loss, overflow, or surface reset returns `DecodeGate` to `AWAITING_IDR`.
+
+## TV-Origin Pairing QR Payload
+Offline QR payload (`PairingPayloadCodec`) is URL-safe Base64 without padding of seven UTF-8 newline-separated fields: `CPZ0`, `version`, numeric TV IP, TCP port, UDP port, pairing token, expiry epoch seconds.

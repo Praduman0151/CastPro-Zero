@@ -6,7 +6,7 @@ plugins {
 android {
     namespace = "com.castpro.zero.tv"
     compileSdk = libs.versions.compileSdk.get().toInt()
-    defaultConfig { applicationId = "com.castpro.zero.tv"; minSdk = 28; targetSdk = libs.versions.targetSdk.get().toInt(); versionCode = 2; versionName = "1.1.0" }
+    defaultConfig { applicationId = "com.castpro.zero.tv"; minSdk = 28; targetSdk = libs.versions.targetSdk.get().toInt(); versionCode = 3; versionName = "1.0.0" }
     buildFeatures { compose = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }

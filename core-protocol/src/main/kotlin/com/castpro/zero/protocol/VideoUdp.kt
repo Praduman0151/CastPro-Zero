@@ -69,16 +69,13 @@ data class VideoFragment(
                 .putShort(fragmentIndex.toShort()).putShort(fragmentCount.toShort()).putShort(wireLen.toShort()).putShort(0)
                 .putLong(captureTimestampNs)
             if (encrypted) {
-                val aad = out.copyOf(VIDEO_HEADER_BYTES)
-                val sealed = PacketSeal.seal(
+                PacketSeal.sealInto(
                     videoKey!!,
                     PacketSeal.videoNonce(frameId, fragmentIndex, fragmentCount),
-                    aad,
-                    source,
-                    payloadLength,
-                    offset
+                    out, 0, VIDEO_HEADER_BYTES,
+                    source, offset, payloadLength,
+                    out, VIDEO_HEADER_BYTES
                 )
-                sealed.copyInto(out, VIDEO_HEADER_BYTES)
             } else {
                 source.copyInto(out, VIDEO_HEADER_BYTES, offset, offset + payloadLength)
             }
@@ -201,14 +198,15 @@ class VideoReassembler(
         }
         val plaintextPart = if (videoKey != null) {
             try {
-                val aad = packet.copyOf(VIDEO_HEADER_BYTES)
                 PacketSeal.open(
                     videoKey,
                     PacketSeal.videoNonce(h.frameId, h.fragmentIndex, h.fragmentCount),
-                    aad,
+                    packet,
                     packet,
                     h.payloadLength,
-                    VIDEO_HEADER_BYTES
+                    VIDEO_HEADER_BYTES,
+                    aadOffset = 0,
+                    aadLength = VIDEO_HEADER_BYTES
                 )
             } catch (_: Exception) {
                 return ReassemblyOutcome(requestPli = expiredPli, dropped = expiredCount + 1, rejected = true)
