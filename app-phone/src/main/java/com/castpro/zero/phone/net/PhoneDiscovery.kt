@@ -26,9 +26,10 @@ class PhoneDiscovery(
                 acquire()
             }
     private val socket = DatagramSocket(null).apply {
+        reuseAddress = true
         broadcast = true
         soTimeout = 500
-        binding.bindUdp(this, Discovery.DISCOVERY_PORT)
+        binding.bindUdp(this, Discovery.DISCOVERY_PORT, bindToInterfaceAddress = false)
     }
     private val thread = Thread({ loop() }, "CPZ-phone-discovery")
 

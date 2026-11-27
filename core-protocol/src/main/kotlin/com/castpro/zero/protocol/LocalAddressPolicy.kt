@@ -10,7 +10,20 @@ object LocalAddressPolicy {
     fun requireAllowed(value:String):String { if(!isAllowed(value)) throw ProtocolException("Only RFC1918 or IPv4 link-local addresses are allowed"); return value }
 }
 object UdpBurstPacer {
-    data class Plan(val burstSize:Int,val pauseMicros:Long)
-    fun plan(fragmentCount:Int):Plan { require(fragmentCount>=0); return if(fragmentCount>30) Plan(12,350L) else Plan(maxOf(1,fragmentCount),0L) }
-    fun shouldRequestRecovery(droppedFragments:Int)=droppedFragments>0
+    data class Plan(val burstSize: Int, val pauseMicros: Long)
+    fun plan(fragmentCount: Int): Plan {
+        require(fragmentCount >= 0)
+        return if (fragmentCount > 30) Plan(12, 350L) else Plan(maxOf(1, fragmentCount), 0L)
+    }
+
+    /** Smooth low-burst pacing for production TX so 30-frag IDRs do not saturate Wi-Fi AP queues. */
+    fun smoothPlan(fragmentCount: Int): Plan {
+        require(fragmentCount >= 0)
+        return when {
+            fragmentCount <= 6 -> Plan(maxOf(1, fragmentCount), 0L)
+            fragmentCount <= 30 -> Plan(6, 120L)
+            else -> Plan(8, 160L)
+        }
+    }
+    fun shouldRequestRecovery(droppedFragments: Int) = droppedFragments > 0
 }

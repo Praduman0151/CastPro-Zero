@@ -314,17 +314,21 @@ class PhoneCaptureService : Service() {
                     is SendOutcome.Sent -> {
                         if (frameLogCount < 10) {
                             frameLogCount++
-                            val nalTypes = AnnexB.nalUnits(frame.buffer.copyOf(frame.length))
-                                .mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
+                            val nalTypes = AnnexB.nalTypes(frame.buffer, VideoCodec.AVC, frame.length)
                             Log.i(TAG, "TX frameId=${outcome.frameId} fragCount=${outcome.fragmentCount} size=${outcome.byteCount} keyframe=${frame.keyframe} NAL=$nalTypes")
                         }
                     }
                     is SendOutcome.NotSent -> {
                         val message = SendFailurePolicy.message(outcome.failure)
-                        if (SendFailurePolicy.isExpected(outcome.failure)) Log.w(TAG, message)
-                        else Log.e(TAG, message, outcome.cause)
-                        PhoneSessionBus.publishStatus(message)
-                        active.set(false)
+                        if (!SendFailurePolicy.isFatal(outcome.failure)) {
+                            Log.w(TAG, "$message; requesting sync frame recovery")
+                            requestEncoderSyncFrame(enc)
+                        } else {
+                            if (SendFailurePolicy.isExpected(outcome.failure)) Log.w(TAG, message)
+                            else Log.e(TAG, message, outcome.cause)
+                            PhoneSessionBus.publishStatus(message)
+                            active.set(false)
+                        }
                     }
                 }
             } catch (e: Exception) {

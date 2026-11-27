@@ -12,7 +12,7 @@ private val CONTROL_MAGIC = byteArrayOf(0x43, 0x50, 0x5A, 0x30)
 
 enum class ControlType(val id: Int) {
     HELLO(1), HELLO_ACK(2), PAIR_CONFIRM(3), STREAM_CONFIG(16), VIDEO_CSD(17),
-    PING(32), PONG(33), PLI(34), STOP(35), RTT_REPORT(36), AUDIO_CONFIG(37), ERROR(127);
+    PING(32), PONG(33), PLI(34), STOP(35), RTT_REPORT(36), AUDIO_CONFIG(37), FRAGMENT_NACK(38), ERROR(127);
     companion object {
         fun fromId(id: Int): ControlType = entries.firstOrNull { it.id == id }
             ?: throw ProtocolException("Unknown control message type: $id")
@@ -28,10 +28,13 @@ object ControlFraming {
     fun write(output: OutputStream, frame: ControlFrame) {
         require(frame.payload.size <= MAX_CONTROL_PAYLOAD) { "Control payload exceeds limit" }
         require(frame.flags in 0..0xffff && frame.sequence in 0..0xffff_ffffL)
-        val h = ByteBuffer.allocate(CONTROL_HEADER_BYTES).order(ByteOrder.BIG_ENDIAN)
-        h.put(CONTROL_MAGIC).put(frame.version.toByte()).put(frame.type.id.toByte())
+        val out = ByteArray(CONTROL_HEADER_BYTES + frame.payload.size)
+        val b = ByteBuffer.wrap(out).order(ByteOrder.BIG_ENDIAN)
+        b.put(CONTROL_MAGIC).put(frame.version.toByte()).put(frame.type.id.toByte())
             .putShort(frame.flags.toShort()).putInt(frame.payload.size).putInt(frame.sequence.toInt()).putLong(frame.sessionId)
-        output.write(h.array()); output.write(frame.payload); output.flush()
+            .put(frame.payload)
+        output.write(out)
+        output.flush()
     }
 
     /** Returns null only when EOF occurs before any byte of a new header. */

@@ -8,6 +8,8 @@ import android.media.projection.MediaProjection
 import android.os.Process
 import android.util.Log
 import com.castpro.zero.phone.net.PhoneSenderTransport
+import com.castpro.zero.phone.net.SendFailurePolicy
+import com.castpro.zero.phone.net.SendOutcome
 import com.castpro.zero.protocol.AudioFrame
 import com.castpro.zero.protocol.ControlMessage
 
@@ -76,14 +78,21 @@ class AudioCapture(
             }
             if (read <= 0) break
             val timestampNs = AudioCapturePolicy.safeTimestamp(System.nanoTime())
+            var fatalSendFailure = false
             try {
-                AudioCapturePolicy.chunkPcm(buffer.copyOf(read)).forEach { chunk ->
-                    sender.sendAudioFrame(AudioFrame(session, sequence++, timestampNs, chunk))
+                for (chunk in AudioCapturePolicy.chunkPcm(buffer.copyOf(read))) {
+                    val outcome = sender.sendAudioFrame(AudioFrame(session, sequence++, timestampNs, chunk))
+                    if (outcome is SendOutcome.NotSent && SendFailurePolicy.isFatal(outcome.failure)) {
+                        Log.w(TAG, "Audio transmission stopped: ${SendFailurePolicy.message(outcome.failure)}")
+                        fatalSendFailure = true
+                        break
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Audio transmission failed", e)
                 break
             }
+            if (fatalSendFailure) break
         }
         running = false
         onState(false)
