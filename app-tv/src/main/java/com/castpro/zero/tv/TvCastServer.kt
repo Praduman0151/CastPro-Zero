@@ -2,21 +2,28 @@ package com.castpro.zero.tv
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import com.castpro.zero.protocol.*
 import java.net.*
 import java.security.SecureRandom
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.ceil
+import kotlin.math.roundToLong
 
-class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val pairingToken: String = createPairingToken()) {
+class TvCastServer(
+    private val callbacks: Callbacks = object : Callbacks {},
+    val pairingToken: String = createPairingToken()
+) {
     interface Callbacks {
         fun onStatus(value: String) {}
         fun onAddress(ip: String, token: String) {}
@@ -30,6 +37,8 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         const val TCP_PORT = 45670
         const val UDP_PORT = 45671
         const val DISCOVERY_PORT = 45672
+        private const val TAG = "CPZ-TV"
+        private const val MAX_CONCURRENT_HANDSHAKES = 4
         private fun createPairingToken(): String = ByteArray(24).also(SecureRandom()::nextBytes)
             .let { java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
     }
@@ -41,36 +50,66 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     @Volatile private var discovery: DatagramSocket? = null
     @Volatile private var control: Socket? = null
     @Volatile private var audioTrack: AudioTrack? = null
-    @Volatile private var audioQueue: AudioPlaybackQueue? = null
+    @Volatile private var audioBuffer: OrderedAudioPlaybackBuffer? = null
+    private val clockOffset = ClockOffsetEstimator()
+    private val avSync = AvSyncController(maxDriftNs = 25_000_000L)
+    private val audioTimestamp = AudioTimestamp()
+    private val audioFramesWritten = AtomicLong(0L)
+    @Volatile private var latestAudioCaptureNs = 0L
+    @Volatile private var latestVideoRenderedCaptureNs = 0L
+
     private val health = StreamHealthCounters()
+    private val decoderLock = Any()
     @Volatile private var decoder: MediaCodec? = null
     @Volatile private var surface: Surface? = null
     @Volatile private var sessionId = 0L
     @Volatile private var authenticated = false
     @Volatile private var authenticatedPeer: InetAddress? = null
     @Volatile private var csd: ByteArray? = null
+    @Volatile private var pendingCsdForDecoder: ByteArray? = null
     @Volatile private var stream: ControlMessage.StreamConfig? = null
-    @Volatile private var gate = DecodeGate(VideoCodec.AVC)
+    private val gate = DecodeGate(VideoCodec.AVC)
     private val csdTracker = DecoderCsdTracker()
-    @Volatile private var rendered = 0L
-    @Volatile private var dropped = 0L
+    private var videoQueue = TvVideoFrameQueue(capacity = 6)
+    private val controlSendQueue = TvControlSendQueue(capacity = 64)
+    private val fpsTracker = VsyncFpsTracker()
+
+    private val dropped = AtomicLong(0L)
+    private val bytesRenderedWindow = AtomicLong(0L)
+    private val activeHandshakes = AtomicInteger(0)
     private val rttState = RttTelemetryState()
-    @Volatile private var bytesRenderedWindow = 0L
     @Volatile private var liveMbps = 0.0
     @Volatile private var renderedFps = 0L
-    
+    @Volatile private var tvLocalPipelineMs = 0L
     @Volatile private var decoderName = "idle"
     @Volatile private var resolution = "—"
+
     private val sequence = AtomicLong(0L)
-    private var lastPliNs = 0L
+    private val lastPliNs = AtomicLong(0L)
     private var firstTenFrames = 0
     @Volatile private var discoveryStarted = false
     @Volatile private var firstRenderedFrameLogged = false
 
+    // Ring tracking input ptsUs -> local TV arrival time for decode+render latency telemetry
+    private val ptsTrackLock = Any()
+    private val ptsKeys = LongArray(64)
+    private val ptsArrivalNs = LongArray(64)
+    private var ptsIdx = 0
+
+    private val lifecycleExecutor =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "CPZ-TV-lifecycle") }
+
+    @Volatile private var controlThread: Thread? = null
+    @Volatile private var telemetryThread: Thread? = null
+    @Volatile private var controlTxThread: Thread? = null
+    @Volatile private var videoRxThread: Thread? = null
+    @Volatile private var audioRxThread: Thread? = null
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        Thread({ listenLoop() }, "CPZ-TV-control").start()
-        Thread({ telemetryLoop() }, "CPZ-TV-telemetry").start()
+        controlThread = Thread({ listenLoop() }, "CPZ-TV-control").also { it.start() }
+        telemetryThread = Thread({ telemetryLoop() }, "CPZ-TV-telemetry").also { it.start() }
+        controlTxThread = Thread({ controlTxLoop() }, "CPZ-TV-control-tx").also { it.start() }
     }
 
     fun refreshNetwork() {
@@ -81,16 +120,23 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
     }
 
     private data class LanAddress(val address: Inet4Address, val broadcast: Inet4Address?)
+
     private fun privateAddress(): LanAddress? {
         return try {
             NetworkInterface.getNetworkInterfaces().toList()
                 .filter { it.isUp && !it.isLoopback }
-                .flatMap { ni -> ni.interfaceAddresses.mapNotNull { ia ->
-                    val a = ia.address
-                    if (a is Inet4Address && LocalAddressPolicy.isAllowed(a.hostAddress ?: "")) LanAddress(a, ia.broadcast as? Inet4Address) else null
-                } }
+                .flatMap { ni ->
+                    ni.interfaceAddresses.mapNotNull { ia ->
+                        val a = ia.address
+                        if (a is Inet4Address && LocalAddressPolicy.isAllowed(a.hostAddress ?: "")) {
+                            LanAddress(a, ia.broadcast as? Inet4Address)
+                        } else null
+                    }
+                }
                 .firstOrNull()
-        } catch (_: Exception) { null }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun listenLoop() {
@@ -103,40 +149,194 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                     continue
                 }
                 val ip = lan.address.hostAddress ?: continue
-                val tcp = ServerSocket(TCP_PORT, 4, lan.address)
-                val video = DatagramSocket(UDP_PORT, lan.address).apply { receiveBufferSize = 4 * 1024 * 1024; soTimeout = 100 }
+                val tcp = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(lan.address, TCP_PORT), 4)
+                }
+                val video = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(lan.address, UDP_PORT))
+                    receiveBufferSize = 4 * 1024 * 1024
+                    soTimeout = 5
+                    try { trafficClass = 0x88 } catch (_: Exception) {}
+                }
                 val audioSocket = try {
-                    DatagramSocket(TvReceiverPolicy.audioPortFor(UDP_PORT), lan.address).apply {
-                        receiveBufferSize = 2 * 1024 * 1024; soTimeout = 100
+                    DatagramSocket(null).apply {
+                        reuseAddress = true
+                        bind(InetSocketAddress(lan.address, TvReceiverPolicy.audioPortFor(UDP_PORT)))
+                        receiveBufferSize = 2 * 1024 * 1024
+                        soTimeout = 20
+                        try { trafficClass = 0xB8 } catch (_: Exception) {}
                     }.also { audio = it }
                 } catch (e: Exception) {
                     if (TvReceiverPolicy.audioFailureIsNonFatal()) {
-                        Log.w("CPZ-TV", "Audio receiver unavailable; video cast continues", e)
+                        Log.w(TAG, "Audio receiver unavailable; video cast continues", e)
                     }
                     null
                 }
-                Log.i("CPZ-TV", "UDP receive buffer requested=4 MiB actual=${video.receiveBufferSize}; audio port=${TvReceiverPolicy.audioPortFor(UDP_PORT)} bound=${audioSocket != null}")
-                tcpServer = tcp; udp = video
+                Log.i(
+                    TAG,
+                    "UDP receive buffer requested=4 MiB actual=${video.receiveBufferSize}; audio port=${TvReceiverPolicy.audioPortFor(UDP_PORT)} bound=${audioSocket != null}"
+                )
+                tcpServer = tcp
+                udp = video
                 callbacks.onAddress(ip, pairingToken)
                 callbacks.onStatus("Receiver ready · $ip")
                 startDiscoveryResponder()
-                Thread({ receiveVideo(video) }, "CPZ-TV-udp").start()
-                if (audioSocket != null) Thread({ receiveAudio(audioSocket) }, "CPZ-TV-udp-audio").start()
+                videoRxThread = Thread({ receiveVideo(video) }, "CPZ-TV-udp").also { it.start() }
+                if (audioSocket != null) {
+                    audioRxThread = Thread({ receiveAudio(audioSocket) }, "CPZ-TV-udp-audio").also { it.start() }
+                }
                 while (running.get() && !tcp.isClosed) {
-                    try { handle(tcp.accept()) }
-                    catch (e: SocketException) { if (running.get()) Log.i("CPZ-TV", "Network listener rebinding", e); break }
+                    try {
+                        val incoming = tcp.accept()
+                        if (activeHandshakes.get() >= MAX_CONCURRENT_HANDSHAKES) {
+                            try { incoming.close() } catch (_: Exception) {}
+                            continue
+                        }
+                        activeHandshakes.incrementAndGet()
+                        Thread({ handleClientSession(incoming) }, "CPZ-TV-session").start()
+                    } catch (e: SocketException) {
+                        if (running.get()) Log.i(TAG, "Network listener rebinding", e)
+                        break
+                    }
                 }
             } catch (e: Exception) {
                 if (running.get()) {
-                    Log.w("CPZ-TV", "LAN listener unavailable; retrying", e)
+                    Log.w(TAG, "LAN listener unavailable; retrying", e)
                     callbacks.onStatus("Network unavailable · retrying")
-                    try { Thread.sleep(1000) } catch (_: InterruptedException) { }
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
                 }
             } finally {
                 try { tcpServer?.close() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
                 try { audio?.close() } catch (_: Exception) {}
-                tcpServer = null; udp = null; audio = null
+                try { videoRxThread?.join(300) } catch (_: InterruptedException) {}
+                try { audioRxThread?.join(300) } catch (_: InterruptedException) {}
+                tcpServer = null
+                udp = null
+                audio = null
+            }
+        }
+    }
+
+    private fun handleClientSession(socket: Socket) {
+        var handshakeCounted = true
+        try {
+            socket.soTimeout = 4_000
+            socket.tcpNoDelay = true
+            try { socket.trafficClass = 0x10 } catch (_: Exception) {}
+            val sid = SessionHandshake.server(socket, pairingToken)
+            activeHandshakes.decrementAndGet()
+            handshakeCounted = false
+
+            // Swap out any stale previous TCP session immediately on valid auth so reconnects never wait 15s.
+            val oldSocket = synchronized(this) {
+                val prev = control
+                control = socket
+                sessionId = sid
+                authenticatedPeer = socket.inetAddress
+                authenticated = true
+                firstTenFrames = 0
+                firstRenderedFrameLogged = false
+                lastPliNs.set(0L)
+                latestAudioCaptureNs = 0L
+                latestVideoRenderedCaptureNs = 0L
+                clockOffset.reset()
+                audioBuffer = OrderedAudioPlaybackBuffer(sid)
+                health.reset()
+                dropped.set(0L)
+                fpsTracker.reset()
+                controlSendQueue.clear()
+                prev
+            }
+            if (oldSocket != null && oldSocket !== socket) {
+                try { oldSocket.close() } catch (_: Exception) {}
+            }
+
+            socket.soTimeout = 12_000
+            callbacks.onStatus("Authenticated phone session")
+            val input = socket.getInputStream()
+            while (running.get() && !socket.isClosed && authenticated && control === socket) {
+                val frame = ControlFraming.read(input) ?: break
+                if (frame.sessionId != sessionId) continue
+                when (val message = ControlMessageCodec.decode(frame.type, frame.payload)) {
+                    is ControlMessage.StreamConfig -> {
+                        if (message.codec != 1 || message.width !in 1..8192 || message.height !in 1..8192) {
+                            Log.w(TAG, "Rejected invalid stream config")
+                            continue
+                        }
+                        val previous = stream
+                        if (previous != null &&
+                            (previous.width != message.width || previous.height != message.height || previous.codec != message.codec)
+                        ) {
+                            stopDecoder()
+                            csd = null
+                            pendingCsdForDecoder = null
+                            gate.onDecoderRecreated()
+                        }
+                        stream = message
+                        resolution = "${message.width}×${message.height}"
+                        callbacks.onStreamConfig(message)
+                        lifecycleExecutor.execute { configureDecoderIfReady() }
+                    }
+                    is ControlMessage.VideoCsd -> applyControlCsd(message)
+                    is ControlMessage.AudioConfig -> {
+                        if (TvReceiverPolicy.isSupportedAudioConfig(
+                                message.sampleRateHz, message.channelCount, message.bitDepth, message.encoding
+                            )
+                        ) {
+                            configureAudioTrack(message)
+                        } else {
+                            Log.w(TAG, "Rejected unsupported audio config: $message")
+                        }
+                    }
+                    is ControlMessage.Ping -> controlSendQueue.offer(
+                        ControlMessage.Pong(message.timestampNs, message.pingSequence)
+                    )
+                    is ControlMessage.Pong -> rttState.acceptPong(message, System.nanoTime())
+                    is ControlMessage.RttReport -> rttState.acceptPhoneReport(message.rttMs)
+                    is ControlMessage.Stop -> {
+                        clearSession("Casting stopped")
+                        break
+                    }
+                    else -> Unit
+                }
+            }
+        } catch (e: Exception) {
+            if (running.get()) Log.i(TAG, "Control peer disconnected", e)
+        } finally {
+            if (handshakeCounted) activeHandshakes.decrementAndGet()
+            if (control === socket) {
+                control = null
+                clearSession("Phone disconnected")
+            }
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun controlTxLoop() {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
+        while (running.get()) {
+            val msg = try {
+                controlSendQueue.poll(100) ?: continue
+            } catch (_: InterruptedException) {
+                continue
+            }
+            val peer = control ?: continue
+            if (peer.isClosed || !authenticated) continue
+            try {
+                ControlFraming.write(
+                    peer.getOutputStream(),
+                    ControlFrame(
+                        type = ControlMessageCodec.typeOf(msg),
+                        sequence = sequence.getAndIncrement(),
+                        sessionId = sessionId,
+                        payload = ControlMessageCodec.encode(msg)
+                    )
+                )
+            } catch (_: Exception) {
+                // Socket errors are cleaned up by the session control reader.
             }
         }
     }
@@ -160,18 +360,22 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                     val request = DatagramPacket(ByteArray(256), 256)
                     try {
                         socket.receive(request)
-                        val text = String(request.data, 0, request.length, Charsets.UTF_8).trim()
-                        if (text == Discovery.REQUEST_MAGIC) {
-                            val lanForReply = privateAddress()
-                            val replyIp = lanForReply?.address?.hostAddress
-                            if (replyIp != null) {
-                                val reply = advertisement(replyIp)
-                                socket.send(DatagramPacket(reply, reply.size, request.address, request.port))
+                        if (!authenticated) {
+                            val text = String(request.data, 0, request.length, Charsets.UTF_8).trim()
+                            if (text == Discovery.REQUEST_MAGIC) {
+                                val lanForReply = privateAddress()
+                                val replyIp = lanForReply?.address?.hostAddress
+                                if (replyIp != null) {
+                                    val reply = advertisement(replyIp)
+                                    socket.send(DatagramPacket(reply, reply.size, request.address, request.port))
+                                }
                             }
                         }
-                    } catch (_: java.net.SocketTimeoutException) {
+                    } catch (_: SocketTimeoutException) {
                         // Allows periodic advertisement and shutdown checks.
                     }
+                    // Stop interface polling & LAN broadcasts while actively casting to save TV CPU & radio airtime.
+                    if (authenticated) continue
                     val now = System.nanoTime()
                     if (now - lastAdvertiseNs < 1_500_000_000L) continue
                     val lan = privateAddress() ?: continue
@@ -182,7 +386,7 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                     lastAdvertiseNs = now
                 }
             } catch (e: Exception) {
-                if (running.get()) Log.w("CPZ-TV", "Discovery responder unavailable", e)
+                if (running.get()) Log.w(TAG, "Discovery responder unavailable", e)
             } finally {
                 discoveryStarted = false
                 try { localSocket?.close() } catch (_: Exception) {}
@@ -202,85 +406,29 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         )
     ).toByteArray(Charsets.UTF_8)
 
-    private fun handle(socket: Socket) {
-        try {
-            socket.soTimeout = 15000
-            val sid = SessionHandshake.server(socket, pairingToken)
-            control = socket; sessionId = sid; authenticatedPeer = socket.inetAddress; authenticated = true
-            firstTenFrames = 0
-            firstRenderedFrameLogged = false
-            lastPliNs = 0L
-            audioQueue = AudioPlaybackQueue(sid); health.reset()
-            callbacks.onStatus("Authenticated phone session")
-            val input = socket.getInputStream(); val output = socket.getOutputStream()
-            while (running.get() && !socket.isClosed && authenticated) {
-                val frame = ControlFraming.read(input) ?: break
-                if (frame.sessionId != sessionId) continue
-                when (val message = ControlMessageCodec.decode(frame.type, frame.payload)) {
-                    is ControlMessage.StreamConfig -> {
-                        if (message.codec != 1 || message.width !in 1..8192 || message.height !in 1..8192) {
-                            Log.w("CPZ-TV", "Rejected invalid stream config"); continue
-                        }
-                        val previous = stream
-                        if (previous != null && (previous.width != message.width || previous.height != message.height || previous.codec != message.codec)) {
-                            stopDecoder(); csd = null; gate = DecodeGate(VideoCodec.AVC)
-                        }
-                        stream = message; resolution = "${message.width}×${message.height}"
-                        callbacks.onStreamConfig(message); configureDecoderIfReady()
-                    }
-                    is ControlMessage.VideoCsd -> applyControlCsd(message)
-                    is ControlMessage.AudioConfig -> {
-                        if (TvReceiverPolicy.isSupportedAudioConfig(
-                                message.sampleRateHz, message.channelCount, message.bitDepth, message.encoding)) {
-                            configureAudioTrack(message)
-                        } else {
-                            Log.w("CPZ-TV", "Rejected unsupported audio config: $message")
-                        }
-                    }
-                    is ControlMessage.Ping -> synchronized(socket) {
-                        ControlFraming.write(output, ControlFrame(
-                            type = ControlType.PONG, sequence = sequence.getAndIncrement(), sessionId = sessionId,
-                            payload = ControlMessageCodec.encode(ControlMessage.Pong(message.timestampNs, message.pingSequence))))
-                    }
-                    is ControlMessage.Pong -> rttState.acceptPong(message, System.nanoTime())
-                    is ControlMessage.RttReport -> rttState.acceptPhoneReport(message.rttMs)
-                    is ControlMessage.Stop -> {
-                        clearSession("Casting stopped")
-                        break
-                    }
-                    else -> Unit
-                }
-            }
-        } catch (e: Exception) {
-            if (running.get()) Log.i("CPZ-TV", "Control peer disconnected", e)
-        } finally {
-            if (control === socket) {
-                control = null
-                clearSession("Phone disconnected")
-            }
-            try { socket.close() } catch (_: Exception) {}
-        }
-    }
-
-    /**
-     * A CSD control frame does not by itself prove the decoder has parameter sets.
-     * Only queueCsd() may open the gate, so a replay after a failed queue cannot
-     * send an IDR into a CSD-less decoder.
-     */
-    @Synchronized private fun applyControlCsd(message: ControlMessage.VideoCsd) {
+    private fun applyControlCsd(message: ControlMessage.VideoCsd) {
         val data = message.annexB
         val valid = message.codec == 1 && AnnexB.extract(data, VideoCodec.AVC) != null
-        when (csdTracker.actionForControlCsd(decoder != null, valid)) {
-            CsdAction.REJECT -> Log.w("CPZ-TV", "Rejected invalid Annex-B AVC CSD")
-            CsdAction.CONFIGURE -> {
-                csd = data.copyOf()
-                configureDecoderIfReady()
+        synchronized(decoderLock) {
+            when (csdTracker.actionForControlCsd(decoder != null, valid)) {
+                CsdAction.REJECT -> Log.w(TAG, "Rejected invalid Annex-B AVC CSD")
+                CsdAction.CONFIGURE -> {
+                    csd = data.copyOf()
+                    lifecycleExecutor.execute { configureDecoderIfReady() }
+                }
+                CsdAction.QUEUE_NOW -> {
+                    csd = data.copyOf()
+                    pendingCsdForDecoder = csd
+                    videoQueue.signalWakeup()
+                }
+                CsdAction.NONE -> {
+                    csd = data.copyOf()
+                    if (gate.state != DecodeGate.State.OPEN) {
+                        pendingCsdForDecoder = csd
+                        videoQueue.signalWakeup()
+                    }
+                }
             }
-            CsdAction.QUEUE_NOW -> {
-                csd = data.copyOf()
-                decoder?.let { queueCsd(it, data) }
-            }
-            CsdAction.NONE -> csd = data.copyOf()
         }
     }
 
@@ -289,137 +437,329 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
         try {
             val channelMask = AudioFormat.CHANNEL_OUT_STEREO
             val min = AudioTrack.getMinBufferSize(config.sampleRateHz, channelMask, AudioFormat.ENCODING_PCM_16BIT)
-            if (min <= 0) { Log.w("CPZ-TV", "AudioTrack minimum buffer unavailable: $min"); return }
+            if (min <= 0) {
+                Log.w(TAG, "AudioTrack minimum buffer unavailable: $min")
+                return
+            }
             val format = AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(config.sampleRateHz)
                 .setChannelMask(channelMask)
                 .build()
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            val targetBufferBytes = maxOf(min, 4 * 3840) // ~80ms ceiling or hardware min
+            val builder = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
                 .setAudioFormat(format)
-                .setBufferSizeInBytes(maxOf(min, 32 * 1024))
+                .setBufferSizeInBytes(targetBufferBytes)
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            }
+            val track = builder.build()
+            audioFramesWritten.set(0L)
             track.play()
             audioTrack = track
-            Log.i("CPZ-TV", "AudioTrack active: ${config.sampleRateHz} Hz stereo PCM16, minBuffer=$min")
+            Log.i(TAG, "AudioTrack active: ${config.sampleRateHz} Hz stereo PCM16, minBuffer=$min targetBuffer=$targetBufferBytes")
         } catch (e: Exception) {
-            Log.w("CPZ-TV", "AudioTrack setup failed", e)
+            Log.w(TAG, "AudioTrack setup failed", e)
             stopAudio()
         }
     }
 
     @Synchronized private fun stopAudio() {
-        val track = audioTrack; audioTrack = null
+        val track = audioTrack
+        audioTrack = null
+        audioFramesWritten.set(0L)
         if (track != null) try { track.stop() } catch (_: Exception) {}
         if (track != null) try { track.release() } catch (_: Exception) {}
     }
 
-    /** Authenticated audio datagrams are written to AudioTrack in sequence order. */
+    /** Authenticated audio datagrams reordered and paced against rendered video timestamps. */
     private fun receiveAudio(socket: DatagramSocket) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Exception) {}
         val bytes = ByteArray(MAX_UDP_DATAGRAM_BYTES)
-        var lastWrittenSequence = -1L
+        val packet = DatagramPacket(bytes, bytes.size)
         var lastSession = 0L
-        while (running.get() && !socket.isClosed) try {
-            val packet = DatagramPacket(bytes, bytes.size)
-            socket.receive(packet)
-            if (!authenticated) continue
-            if (packet.address != authenticatedPeer || !LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) continue
-            val frame = try { AudioFrame.decode(packet.data.copyOf(packet.length)) } catch (_: Exception) { continue }
-            if (frame.sessionId != sessionId) continue
-            val track = audioTrack ?: continue
-            val queue = audioQueue ?: continue
-            if (lastSession != sessionId) { lastSession = sessionId; lastWrittenSequence = -1L }
-            // The phone and TV have independent monotonic clock origins; stamp on arrival.
-            val arrivalNs = System.nanoTime()
-            val playable = queue.accept(frame.copy(timestampNs = arrivalNs), arrivalNs)
-            playable.forEach { candidate ->
-                if (candidate.sequence > lastWrittenSequence) {
-                    try {
-                        val written = track.write(candidate.pcm, 0, candidate.pcm.size, AudioTrack.WRITE_NON_BLOCKING)
-                        if (TvReceiverPolicy.shouldAdvanceSequence(written, candidate.pcm.size)) {
-                            lastWrittenSequence = candidate.sequence
-                        }
-                        // A full/partial track buffer defers this datagram to the next arrival.
-                    } catch (_: Exception) {}
+        while (running.get() && !socket.isClosed) {
+            try {
+                packet.length = bytes.size
+                socket.receive(packet)
+                if (!authenticated) continue
+                if (packet.address != authenticatedPeer || !LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) {
+                    continue
                 }
+                val frame = try {
+                    AudioFrame.decode(packet.data.copyOf(packet.length))
+                } catch (_: Exception) {
+                    continue
+                }
+                if (frame.sessionId != sessionId) continue
+                val track = audioTrack ?: continue
+                val buf = audioBuffer ?: continue
+                if (lastSession != sessionId) {
+                    lastSession = sessionId
+                    buf.clear()
+                }
+                val arrivalNs = System.nanoTime()
+                clockOffset.observe(frame.timestampNs, arrivalNs)
+                val senderNowNs = clockOffset.toSenderTimeNs(arrivalNs)
+                buf.offer(frame, senderNowNs)
+                drainAudioBuffer(track, buf, senderNowNs)
+            } catch (_: SocketTimeoutException) {
+                val track = audioTrack ?: continue
+                val buf = audioBuffer ?: continue
+                drainAudioBuffer(track, buf, clockOffset.toSenderTimeNs(System.nanoTime()))
+            } catch (e: SocketException) {
+                if (running.get() && !socket.isClosed) Log.w(TAG, "Audio UDP socket error", e)
+                break
+            } catch (e: Exception) {
+                if (running.get()) Log.w(TAG, "Audio UDP receive error", e)
             }
-        } catch (_: SocketTimeoutException) {
-            // Timeout exists to observe shutdown between packets.
-        } catch (e: SocketException) {
-            if (running.get() && !socket.isClosed) Log.w("CPZ-TV", "Audio UDP socket error", e)
-            break
-        } catch (e: Exception) {
-            if (running.get()) Log.w("CPZ-TV", "Audio UDP receive error", e)
         }
     }
 
-    @Synchronized private fun configureDecoderIfReady() {
-        val cfg = stream ?: return
-        val data = csd ?: return
-        val target = surface ?: return
-        if (!target.isValid || decoder != null) return
+    private fun drainAudioBuffer(track: AudioTrack, buf: OrderedAudioPlaybackBuffer, senderNowNs: Long) {
+        while (running.get() && audioTrack === track) {
+            val head = buf.peekPlayable(senderNowNs) ?: break
+            val queuedPlaybackDelayNs = computeQueuedAudioLatencyNs(track)
+            val audioPlayheadCaptureNs = (latestAudioCaptureNs - queuedPlaybackDelayNs).coerceAtLeast(0L)
+            when (avSync.evaluate(latestVideoRenderedCaptureNs, audioPlayheadCaptureNs)) {
+                AvSyncAction.DROP_STALE_AUDIO -> {
+                    if (buf.queuedFrames() > 1 && buf.dropHead()) continue
+                }
+                AvSyncAction.HOLD_AUDIO -> return
+                AvSyncAction.PLAY_NORMAL -> Unit
+            }
+            val written = try {
+                track.write(head.frame.pcm, head.offset, head.remaining, AudioTrack.WRITE_NON_BLOCKING)
+            } catch (_: Exception) {
+                return
+            }
+            if (written > 0) {
+                audioFramesWritten.addAndGet((written / 4).toLong())
+                latestAudioCaptureNs = head.frame.timestampNs
+                buf.advanceHead(written)
+                if (written < head.remaining) break // Track buffer saturated; keep remaining tail for next turn.
+            } else {
+                break
+            }
+        }
+    }
+
+    private fun computeQueuedAudioLatencyNs(track: AudioTrack): Long {
+        val totalFrames = audioFramesWritten.get()
+        if (totalFrames <= 0L) return 0L
+        return try {
+            if (track.getTimestamp(audioTimestamp)) {
+                val bufferedFrames = (totalFrames - audioTimestamp.framePosition).coerceIn(0L, 48_000L)
+                bufferedFrames * 1_000_000_000L / 48_000L
+            } else {
+                40_000_000L
+            }
+        } catch (_: Exception) {
+            40_000_000L
+        }
+    }
+
+    private fun configureDecoderIfReady() {
+        val codecToStart: MediaCodec
+        val cfg: ControlMessage.StreamConfig
+        val data: ByteArray
+        val target: Surface
+        synchronized(decoderLock) {
+            cfg = stream ?: return
+            data = csd ?: return
+            target = surface ?: return
+            if (!target.isValid || decoder != null) return
+        }
         try {
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, cfg.width, cfg.height)
             val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            val capabilities = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            if (Build.VERSION.SDK_INT >= 30 && capabilities.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency))
-                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            // Annex-B CSD is queued as a codec-config input buffer only after start(); no csd-0/csd-1 keys.
-            codec.configure(format, target, null, 0)
+            configureDecoderTiers(codec, cfg, target)
             codec.start()
-            // Close the gap between exposing the decoder to receiveVideo() and
-            // reapplying CSD: a recreated decoder must gate every frame until then.
-            gate.onDecoderRecreated()
-            csdTracker.onDecoderCreated()
-            decoder = codec
-            decoderName = codec.name
-            Log.i("CPZ-TV", "Active decoder: $decoderName")
             codec.setOnFrameRenderedListener({ _, presentationTimeUs, nanoTime ->
+                fpsTracker.onFrameRendered(nanoTime)
+                val captureNs = presentationTimeUs * 1_000L
+                latestVideoRenderedCaptureNs = captureNs
+                val arrivalNs = lookupPtsArrival(presentationTimeUs)
+                if (arrivalNs > 0L) {
+                    val sampleMs = ((System.nanoTime() - arrivalNs).coerceAtLeast(0L)) / 1_000_000L
+                    tvLocalPipelineMs = if (tvLocalPipelineMs == 0L) sampleMs else ((tvLocalPipelineMs * 3 + sampleMs) / 4)
+                }
                 if (!firstRenderedFrameLogged) {
                     firstRenderedFrameLogged = true
-                    Log.i("CPZ-TV", "FIRST_RENDERED_FRAME elapsedRealtimeNs=$nanoTime presentationTimeUs=$presentationTimeUs")
+                    Log.i(TAG, "FIRST_RENDERED_FRAME elapsedRealtimeNs=$nanoTime presentationTimeUs=$presentationTimeUs")
                     callbacks.onFirstFrameRendered()
                 }
             }, null)
-            queueCsd(codec, data)
-            Thread({ drainOutput(codec) }, "CPZ-TV-output-drain").start()
+            codecToStart = codec
         } catch (e: Exception) {
-            Log.e("CPZ-TV", "Decoder setup failed", e)
-            stopDecoder(); health.onSetupFailureOnly(); requestPli(2)
+            Log.e(TAG, "Decoder setup failed", e)
+            health.onSetupFailureOnly()
+            requestPliAsync(PLI_REASON_DECODER_SETUP)
+            return
+        }
+
+        synchronized(decoderLock) {
+            val currentTarget = surface
+            if (!running.get() || currentTarget == null || !currentTarget.isValid || decoder != null) {
+                try { codecToStart.stop(); codecToStart.release() } catch (_: Exception) {}
+                return
+            }
+            gate.onDecoderRecreated()
+            csdTracker.onDecoderCreated()
+            pendingCsdForDecoder = csd?.copyOf() ?: data.copyOf()
+            decoder = codecToStart
+            decoderName = codecToStart.name
+            videoQueue = TvVideoFrameQueue(capacity = 6)
+            Log.i(TAG, "Active decoder: $decoderName at ${cfg.width}x${cfg.height}@${cfg.fps}")
+            Thread({ feedDecoder(codecToStart, videoQueue) }, "CPZ-TV-decoder-feed").start()
+            Thread({ drainOutput(codecToStart) }, "CPZ-TV-output-drain").start()
         }
     }
 
-    private fun queueCsd(codec: MediaCodec, data: ByteArray) {
+    private fun configureDecoderTiers(codec: MediaCodec, cfg: ControlMessage.StreamConfig, target: Surface) {
+        val capabilities = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val lowLatencySupported = Build.VERSION.SDK_INT >= 30 &&
+            capabilities.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+
+        fun buildFormat(useOperatingRate: Boolean, usePriority: Boolean): MediaFormat =
+            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, cfg.width, cfg.height).apply {
+                if (lowLatencySupported) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                if (usePriority) setInteger(MediaFormat.KEY_PRIORITY, 0)
+                if (useOperatingRate) setInteger(MediaFormat.KEY_OPERATING_RATE, maxOf(cfg.fps * 2, 120))
+                setInteger(MediaFormat.KEY_FRAME_RATE, cfg.fps)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024)
+            }
+
+        try {
+            codec.configure(buildFormat(useOperatingRate = true, usePriority = true), target, null, 0)
+        } catch (_: Exception) {
+            try {
+                codec.configure(buildFormat(useOperatingRate = false, usePriority = true), target, null, 0)
+            } catch (_: Exception) {
+                val base = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, cfg.width, cfg.height).apply {
+                    if (lowLatencySupported) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                }
+                codec.configure(base, target, null, 0)
+            }
+        }
+    }
+
+    /** Single owner of MediaCodec input buffers (both CSD and video access units). */
+    private fun feedDecoder(codec: MediaCodec, queue: TvVideoFrameQueue) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
+        while (running.get() && decoder === codec) {
+            val csdToQueue = synchronized(decoderLock) {
+                val pending = pendingCsdForDecoder
+                pendingCsdForDecoder = null
+                pending
+            }
+            if (csdToQueue != null) {
+                queueCsdOnFeedThread(codec, csdToQueue)
+            }
+            val frame = queue.poll(50) ?: continue
+            if (decoder !== codec) break
+            if (!gate.allowFrame(frame.bytes)) continue
+            try {
+                val index = codec.dequeueInputBuffer(8_000)
+                if (index < 0) {
+                    dropped.incrementAndGet()
+                    health.onDecoderBackpressure()
+                    gate.resetForDiscontinuity()
+                    continue
+                }
+                val input = codec.getInputBuffer(index) ?: continue
+                if (frame.bytes.size > input.capacity()) {
+                    codec.queueInputBuffer(index, 0, 0, 0, 0)
+                    dropped.incrementAndGet()
+                    health.onSetupFailureOnly()
+                    gate.resetForDiscontinuity()
+                    requestPliAsync(5)
+                    continue
+                }
+                input.clear()
+                input.put(frame.bytes)
+                val ptsUs = frame.captureTimestampNs / 1000L
+                recordPtsArrival(ptsUs, System.nanoTime())
+                codec.queueInputBuffer(index, 0, frame.bytes.size, ptsUs, 0)
+                bytesRenderedWindow.addAndGet(frame.bytes.size.toLong())
+            } catch (e: Exception) {
+                if (running.get() && decoder === codec) {
+                    Log.w(TAG, "Decoder input failed; resetting decoder", e)
+                    gate.resetForDiscontinuity()
+                    health.onSetupFailureOnly()
+                    lifecycleExecutor.execute { stopDecoder() }
+                    requestPliAsync(PLI_REASON_DECODER_SETUP)
+                }
+                break
+            }
+        }
+    }
+
+    private fun queueCsdOnFeedThread(codec: MediaCodec, data: ByteArray) {
         if (AnnexB.extract(data, VideoCodec.AVC) == null) {
-            Log.w("CPZ-TV", "Refusing invalid Annex-B AVC CSD after codec.start()")
-            health.onSetupFailureOnly(); requestPli(7)
+            Log.w(TAG, "Refusing invalid Annex-B AVC CSD after codec.start()")
+            health.onSetupFailureOnly()
+            requestPliAsync(7)
             return
         }
-        val index = codec.dequeueInputBuffer(10000)
-        if (index < 0) { Log.w("CPZ-TV", "No input buffer available for CSD"); health.onSetupFailureOnly(); requestPli(7); return }
-        val input = codec.getInputBuffer(index) ?: run { health.onSetupFailureOnly(); requestPli(7); return }
-        if (data.size > input.capacity()) { health.onSetupFailureOnly(); requestPli(7); return }
-        input.clear(); input.put(data)
-        codec.queueInputBuffer(index, 0, data.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
-        gate.onCsd(data)
-        csdTracker.onCsdQueued()
+        try {
+            val index = codec.dequeueInputBuffer(10_000)
+            if (index < 0) {
+                Log.w(TAG, "No input buffer available for CSD")
+                health.onSetupFailureOnly()
+                requestPliAsync(7)
+                return
+            }
+            val input = codec.getInputBuffer(index) ?: run {
+                health.onSetupFailureOnly()
+                requestPliAsync(7)
+                return
+            }
+            if (data.size > input.capacity()) {
+                health.onSetupFailureOnly()
+                requestPliAsync(7)
+                return
+            }
+            input.clear()
+            input.put(data)
+            codec.queueInputBuffer(index, 0, data.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+            gate.onCsd(data)
+            csdTracker.onCsdQueued()
+        } catch (e: Exception) {
+            Log.w(TAG, "queueCsd failed", e)
+            health.onSetupFailureOnly()
+            requestPliAsync(7)
+        }
     }
 
     private fun drainOutput(codec: MediaCodec) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
         val info = MediaCodec.BufferInfo()
         while (running.get() && decoder === codec) {
-            val index = try { codec.dequeueOutputBuffer(info, 10000) } catch (_: Exception) { break }
+            val index = try {
+                codec.dequeueOutputBuffer(info, 10_000)
+            } catch (e: Exception) {
+                if (running.get() && decoder === codec) {
+                    Log.w(TAG, "Decoder output drain failed; restarting decoder", e)
+                    health.onSetupFailureOnly()
+                    lifecycleExecutor.execute { stopDecoder() }
+                    requestPliAsync(PLI_REASON_DECODER_SETUP)
+                }
+                break
+            }
             if (index >= 0) {
                 try {
                     codec.releaseOutputBuffer(index, true)
-                    rendered++
-
-                } catch (e: Exception) {
-                    dropped++; requestPli(3)
+                } catch (_: Exception) {
+                    dropped.incrementAndGet()
+                    gate.resetForDiscontinuity()
+                    requestPliAsync(3)
                 }
             } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val format = codec.outputFormat
@@ -434,96 +774,158 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
                 val displayWidth = (cropRight - cropLeft + 1).coerceAtLeast(1)
                 val displayHeight = (cropBottom - cropTop + 1).coerceAtLeast(1)
                 val crop = if (hasCrop) " crop=$cropLeft,$cropTop-$cropRight,$cropBottom" else ""
-                Log.i("CPZ-TV", "INFO_OUTPUT_FORMAT_CHANGED width=$width height=$height$crop color-format=${if (format.containsKey(MediaFormat.KEY_COLOR_FORMAT)) format.getInteger(MediaFormat.KEY_COLOR_FORMAT) else -1}")
+                Log.i(
+                    TAG,
+                    "INFO_OUTPUT_FORMAT_CHANGED width=$width height=$height$crop color-format=${if (format.containsKey(MediaFormat.KEY_COLOR_FORMAT)) format.getInteger(MediaFormat.KEY_COLOR_FORMAT) else -1}"
+                )
                 resolution = "$displayWidth×$displayHeight"
-                callbacks.onStreamConfig((stream ?: return).copy(width = displayWidth, height = displayHeight))
+                val baseConfig = stream ?: ControlMessage.StreamConfig(1, displayWidth, displayHeight, 60, 20_000_000, 1, 3, 2)
+                callbacks.onStreamConfig(baseConfig.copy(width = displayWidth, height = displayHeight))
             }
         }
     }
 
+    /** Dedicated UDP socket receiver; never blocks on MediaCodec or TCP writes. */
     private fun receiveVideo(socket: DatagramSocket) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
         var reassembler: VideoReassembler? = null
         var reassemblerSession = 0L
         val bytes = ByteArray(MAX_UDP_DATAGRAM_BYTES)
-        while (running.get() && !socket.isClosed) try {
-            val packet = DatagramPacket(bytes, bytes.size); socket.receive(packet)
-            if (!authenticated) continue
-            if (packet.address != authenticatedPeer || !LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) {
-                dropped++; continue
-            }
-            if (reassembler == null || reassemblerSession != sessionId) {
-                reassembler = VideoReassembler(sessionId); reassemblerSession = sessionId
-            }
-            val raw = packet.data.copyOf(packet.length)
-            val fragment = try { VideoFragment.decode(raw) } catch (_: Exception) { dropped++; continue }
-            if (fragment.sessionId != sessionId) { dropped++; continue }
-            val result = reassembler.accept(raw, System.nanoTime())
-            dropped += result.dropped
-            if (result.requestPli) { health.onReassemblyDrop(); requestPli(1) }
-            result.frames.forEach { frame ->
-                val nalTypes = AnnexB.nalUnits(frame.bytes).mapNotNull { it.firstOrNull()?.toInt()?.and(31) }
-                val keyframe = AnnexB.isIdr(frame.bytes, VideoCodec.AVC)
-                if (firstTenFrames < 10) {
-                    firstTenFrames++
-                    Log.i("CPZ-TV", "RX frameId=${frame.frameId} fragCount=${ceil(frame.bytes.size.toDouble() / MAX_VIDEO_PAYLOAD_BYTES).toInt()} size=${frame.bytes.size} keyframe=$keyframe NAL=$nalTypes")
+        val packet = DatagramPacket(bytes, bytes.size)
+        while (running.get() && !socket.isClosed) {
+            try {
+                packet.length = bytes.size
+                socket.receive(packet)
+                if (!authenticated) continue
+                if (packet.address != authenticatedPeer || !LocalAddressPolicy.isAllowed(packet.address.hostAddress ?: "")) {
+                    dropped.incrementAndGet()
+                    continue
                 }
-                val codec = decoder ?: return@forEach
-                if (!gate.allowFrame(frame.bytes)) return@forEach
-                val index = codec.dequeueInputBuffer(2_000)
-                if (index < 0) {
-                    // Decoder backpressure is NOT packet loss: never force an IDR here.
-                    dropped++; health.onDecoderBackpressure(); return@forEach
+                if (reassembler == null || reassemblerSession != sessionId) {
+                    reassembler = VideoReassembler(sessionId, frameDeadlineNs = PRODUCTION_FRAME_DEADLINE_NS, maxInFlight = 6)
+                    reassemblerSession = sessionId
                 }
-                val input = codec.getInputBuffer(index) ?: return@forEach
-                if (frame.bytes.size > input.capacity()) { dropped++; health.onSetupFailureOnly(); requestPli(5); return@forEach }
-                input.clear(); input.put(frame.bytes)
-                codec.queueInputBuffer(index, 0, frame.bytes.size, frame.captureTimestampNs / 1000L, 0)
-                bytesRenderedWindow += frame.bytes.size
+                val nowNs = System.nanoTime()
+                val result = reassembler.accept(packet.data, nowNs, packet.length)
+                if (result.dropped > 0) {
+                    dropped.addAndGet(result.dropped.toLong())
+                    health.onReassemblyDrop()
+                    gate.resetForDiscontinuity()
+                    videoQueue.markDiscontinuity()
+                }
+                if (result.requestPli) {
+                    gate.resetForDiscontinuity()
+                    requestPliAsync(PLI_REASON_REASSEMBLY)
+                }
+                val nacks = reassembler.collectNacks(nowNs)
+                nacks.forEach { controlSendQueue.offer(it) }
+
+                for (frame in result.frames) {
+                    clockOffset.observe(frame.captureTimestampNs, nowNs)
+                    if (firstTenFrames < 10) {
+                        firstTenFrames++
+                        val nalTypes = AnnexB.nalTypes(frame.bytes, VideoCodec.AVC)
+                        val keyframe = AnnexB.isIdr(frame.bytes, VideoCodec.AVC)
+                        Log.i(
+                            TAG,
+                            "RX frameId=${frame.frameId} fragCount=${(frame.bytes.size + MAX_VIDEO_PAYLOAD_BYTES - 1) / MAX_VIDEO_PAYLOAD_BYTES} size=${frame.bytes.size} keyframe=$keyframe NAL=$nalTypes"
+                        )
+                    }
+                    val offered = videoQueue.offer(frame)
+                    if (offered.discontinuityRequired) {
+                        dropped.incrementAndGet()
+                        health.onDecoderBackpressure()
+                        gate.resetForDiscontinuity()
+                    }
+                }
+            } catch (_: SocketTimeoutException) {
+                if (authenticated && reassembler != null) {
+                    val nowNs = System.nanoTime()
+                    reassembler.collectNacks(nowNs).forEach { controlSendQueue.offer(it) }
+                    val (expCount, needPli) = reassembler.expireWithCount(nowNs)
+                    if (expCount > 0) {
+                        dropped.addAndGet(expCount.toLong())
+                        health.onReassemblyDrop()
+                        gate.resetForDiscontinuity()
+                        videoQueue.markDiscontinuity()
+                    }
+                    if (needPli) {
+                        requestPliAsync(PLI_REASON_REASSEMBLY)
+                    }
+                }
+            } catch (e: SocketException) {
+                if (running.get() && !socket.isClosed) Log.w(TAG, "UDP socket error", e)
+                break
+            } catch (e: Exception) {
+                if (running.get()) Log.w(TAG, "UDP receive error", e)
             }
-        } catch (_: SocketTimeoutException) {
-            if (authenticated && reassembler?.expire(System.nanoTime()) == true) {
-                health.onReassemblyDrop(); requestPli(1)
-            }
-        } catch (e: SocketException) {
-            if (running.get() && !socket.isClosed) Log.w("CPZ-TV", "UDP socket error", e)
-            break
-        } catch (e: Exception) {
-            if (running.get()) Log.w("CPZ-TV", "UDP receive error", e)
         }
     }
 
-    /** At most one PLI control frame per 100 ms, including burst loss reports. */
-    private fun requestPli(reason: Int) {
+    /** Non-blocking PLI enqueue coalesced at 100 ms so neither UI nor UDP threads block on TCP. */
+    private fun requestPliAsync(reason: Int) {
+        if (!authenticated || control == null) return
         val now = System.nanoTime()
-        if (now - lastPliNs < PLI_COALESCE_NS) return
-        val s = control ?: return
-        lastPliNs = now
+        val prev = lastPliNs.get()
+        if (now - prev < PLI_COALESCE_NS) return
+        if (!lastPliNs.compareAndSet(prev, now)) return
         health.onPli(reason)
-        try {
-            synchronized(s) {
-                ControlFraming.write(s.getOutputStream(), ControlFrame(type = ControlType.PLI,
-                    sequence = sequence.getAndIncrement(), sessionId = sessionId,
-                    payload = ControlMessageCodec.encode(ControlMessage.Pli(reason))))
-            }
-        } catch (_: Exception) {}
+        controlSendQueue.offer(ControlMessage.Pli(reason))
     }
 
     fun attachSurface(target: Surface) {
         surface = target
-        configureDecoderIfReady()
-        if (csd != null && stream != null) { requestPli(6) }
+        lifecycleExecutor.execute {
+            configureDecoderIfReady()
+            if (authenticated && csd != null && stream != null) {
+                gate.resetForDiscontinuity()
+                requestPliAsync(PLI_REASON_SURFACE)
+            }
+        }
     }
 
     fun detachSurface() {
         surface = null
-        stopDecoder()
+        gate.resetForDiscontinuity()
+        val toStop = synchronized(decoderLock) {
+            val current = decoder
+            decoder = null
+            pendingCsdForDecoder = null
+            videoQueue.clear()
+            csdTracker.onDecoderStopped()
+            decoderName = "idle"
+            current
+        }
+        if (toStop != null) {
+            lifecycleExecutor.execute {
+                try { toStop.stop() } catch (_: Exception) {}
+                try { toStop.release() } catch (_: Exception) {}
+            }
+        }
     }
 
     private fun clearSession(message: String) {
-        authenticated = false; authenticatedPeer = null; sessionId = 0L
-        stream = null; csd = null; gate = DecodeGate(VideoCodec.AVC)
+        authenticated = false
+        authenticatedPeer = null
+        sessionId = 0L
+        stream = null
+        csd = null
+        pendingCsdForDecoder = null
+        gate.onDecoderRecreated()
         rttState.reset()
-        stopAudio(); audioQueue = null; health.reset()
+        clockOffset.reset()
+        stopAudio()
+        audioBuffer = null
+        health.reset()
+        dropped.set(0L)
+        bytesRenderedWindow.set(0L)
+        liveMbps = 0.0
+        renderedFps = 0L
+        tvLocalPipelineMs = 0L
+        resolution = "—"
+        fpsTracker.reset()
+        controlSendQueue.clear()
+        videoQueue.clear()
         stopDecoder()
         callbacks.onSessionIdle()
         callbacks.onStatus(message)
@@ -531,54 +933,76 @@ class TvCastServer(private val callbacks: Callbacks = object : Callbacks {}, val
 
     fun telemetry(): String {
         val h = health.snapshot()
-        return "Rendered FPS: $renderedFps · TCP RTT: ${if (rttState.rttMs >= 0) "${rttState.rttMs}ms" else "n/a"} · UDP dropped: $dropped (${TvReceiverPolicy.formatHealth(h)}) · PLI: ${h.pliCount} · ${"%.2f".format(liveMbps)} Mbps · $resolution · $decoderName"
+        return "Rendered FPS: $renderedFps · TCP RTT: ${if (rttState.rttMs >= 0) "${rttState.rttMs}ms" else "n/a"} · TV Latency: ${tvLocalPipelineMs}ms · UDP dropped: ${dropped.get()} (${TvReceiverPolicy.formatHealth(h)}) · PLI: ${h.pliCount} · ${"%.2f".format(liveMbps)} Mbps · $resolution · $decoderName"
     }
 
     private fun telemetryLoop() {
         var previous = System.nanoTime()
-        var previousRendered = rendered
         while (running.get()) {
-            try { Thread.sleep(1000) } catch (_: InterruptedException) { }
+            try {
+                Thread.sleep(1000)
+            } catch (_: InterruptedException) {
+                if (!running.get()) break
+            }
             val now = System.nanoTime()
             if (authenticated) {
-                val stamp = now
                 val pingSequence = sequence.getAndIncrement()
-                rttState.recordPing(stamp, pingSequence)
-                val peer = control
-                if (peer != null && !peer.isClosed) {
-                    try {
-                        synchronized(peer) {
-                            ControlFraming.write(peer.getOutputStream(), ControlFrame(
-                                type = ControlType.PING, sequence = pingSequence, sessionId = sessionId,
-                                payload = ControlMessageCodec.encode(ControlMessage.Ping(stamp, pingSequence))))
-                        }
-                    } catch (_: Exception) { }
-                }
+                rttState.recordPing(now, pingSequence)
+                controlSendQueue.offer(ControlMessage.Ping(now, pingSequence))
             }
             val elapsed = (now - previous).coerceAtLeast(1L)
-            liveMbps = bytesRenderedWindow * 8.0 / elapsed * 1000.0
-            renderedFps = rendered - previousRendered
-            previousRendered = rendered
-            bytesRenderedWindow = 0L; previous = now
+            val bytesWindow = bytesRenderedWindow.getAndSet(0L)
+            liveMbps = bytesWindow * 8.0 / elapsed * 1000.0
+            renderedFps = fpsTracker.sampleFps(previous, now)
+            previous = now
             callbacks.onTelemetry(telemetry())
         }
     }
 
-    @Synchronized private fun stopDecoder() {
-        val current = decoder; decoder = null
-        csdTracker.onDecoderStopped()
+    private fun recordPtsArrival(ptsUs: Long, arrivalNs: Long) {
+        synchronized(ptsTrackLock) {
+            ptsKeys[ptsIdx] = ptsUs
+            ptsArrivalNs[ptsIdx] = arrivalNs
+            ptsIdx = (ptsIdx + 1) and 63
+        }
+    }
+
+    private fun lookupPtsArrival(ptsUs: Long): Long {
+        synchronized(ptsTrackLock) {
+            for (i in 0 until 64) {
+                if (ptsKeys[i] == ptsUs) return ptsArrivalNs[i]
+            }
+            return 0L
+        }
+    }
+
+    private fun stopDecoder() {
+        val current = synchronized(decoderLock) {
+            val c = decoder
+            decoder = null
+            pendingCsdForDecoder = null
+            videoQueue.clear()
+            csdTracker.onDecoderStopped()
+            decoderName = "idle"
+            c
+        }
         if (current != null) try { current.stop() } catch (_: Exception) {}
         if (current != null) try { current.release() } catch (_: Exception) {}
-        decoderName = "idle"
     }
 
     fun stop() {
         running.set(false)
+        videoQueue.close()
         clearSession("Receiver stopped")
         try { tcpServer?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
         try { audio?.close() } catch (_: Exception) {}
         try { discovery?.close() } catch (_: Exception) {}
         try { control?.close() } catch (_: Exception) {}
+        listOf(controlThread, telemetryThread, controlTxThread, videoRxThread, audioRxThread).forEach { t ->
+            t?.interrupt()
+            try { t?.join(300) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+        }
+        lifecycleExecutor.shutdownNow()
     }
 }

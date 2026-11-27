@@ -6,6 +6,8 @@ import com.castpro.zero.protocol.ControlMessage
 class RttTelemetryState {
     @Volatile var rttMs: Long = -1L
         private set
+    @Volatile var phoneRttMs: Long = -1L
+        private set
     private var expectedTimestampNs: Long = -1L
     private var expectedSequence: Long = -1L
 
@@ -22,10 +24,17 @@ class RttTelemetryState {
         return true
     }
 
-    fun acceptPhoneReport(value: Long) { rttMs = value.coerceAtLeast(0L) }
+    @Synchronized fun acceptPhoneReport(value: Long) {
+        val safe = value.coerceAtLeast(0L)
+        phoneRttMs = safe
+        if (rttMs < 0L) {
+            rttMs = safe
+        }
+    }
 
     @Synchronized fun reset() {
         rttMs = -1L
+        phoneRttMs = -1L
         expectedTimestampNs = -1L
         expectedSequence = -1L
     }
